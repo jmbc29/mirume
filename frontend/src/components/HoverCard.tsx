@@ -198,15 +198,39 @@ interface HoverCardProps {
   cursor: CursorPosition;
 }
 
+/**
+ * Whether the backend response is worth showing a card for.
+ *
+ * The card must stay hidden unless the cursor is actually over meaningful
+ * Japanese text or a translation. It is hidden when:
+ *   - there is no data, OR
+ *   - there are no content-word tokens AND no translations, OR
+ *   - (for the token path) no token carries a real JLPT level.
+ */
+function hasRenderableContent(d: HoverResponse | null): boolean {
+  if (!d) return false;
+  const contentWords = d.tokens.filter((t) => t.is_content_word);
+  if (contentWords.length === 0 && d.translations.length === 0) return false;
+  if (d.translations.length === 0 && !d.tokens.some((t) => t.jlpt_level !== null)) {
+    return false;
+  }
+  return true;
+}
+
 export default function HoverCard({ data, cursor }: HoverCardProps) {
   const [visible, setVisible] = useState(false);
   const [displayData, setDisplayData] = useState<HoverResponse | null>(null);
   const hideTimeoutRef = useRef<number | undefined>(undefined);
 
-  const hasContent = !!data && (data.tokens.length > 0 || data.translations.length > 0);
+  const hasContent = hasRenderableContent(data);
 
   useEffect(() => {
-    if (!hasContent) return;
+    if (!hasContent) {
+      setVisible(false);
+      setDisplayData(null);
+      window.clearTimeout(hideTimeoutRef.current);
+      return;
+    }
     setDisplayData(data);
     setVisible(true);
     window.clearTimeout(hideTimeoutRef.current);
@@ -215,8 +239,9 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
-  // Let clicks (e.g. the save button) through only while the card is showing;
-  // otherwise the overlay stays click-through so it never blocks the app underneath.
+  // The frontend still pings the Rust side when the card shows/hides, but the
+  // overlay is always kept click-through there — it must never block the app
+  // underneath. The inner card div opts back into pointer events on its own.
   useEffect(() => {
     void invoke("set_click_through", { ignore: !visible }).catch(() => {
       // Not running inside Tauri (e.g. plain browser dev) — ignore.
@@ -225,35 +250,40 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
 
   if (!displayData) return null;
 
+  // The same kanji can come back several times (once per token it appears in);
+  // collapse to one chip per literal.
+  const uniqueKanji = displayData.kanji.filter(
+    (k, i, arr) => arr.findIndex((x) => x.literal === k.literal) === i,
+  );
+
   const { left, top } = clampToViewport(cursor.x + CURSOR_OFFSET, cursor.y + CURSOR_OFFSET);
 
   return (
-    <div
-      style={{
-        position: "fixed",
-        left,
-        top,
-        maxWidth: CARD_MAX_WIDTH,
-        backgroundColor: "rgba(26,26,46,0.95)",
-        border: "1px solid rgba(255,255,255,0.1)",
-        borderRadius: 12,
-        padding: 16,
-        boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
-        fontFamily: "system-ui, -apple-system, sans-serif",
-        color: "#e2e8f0",
-        opacity: visible ? 1 : 0,
-        transition: "opacity 150ms ease",
-        pointerEvents: visible ? "auto" : "none",
-      }}
-    >
-      {displayData.tokens
-        .filter((t) => t.is_content_word)
-        .map((t, i) => (
-          <JapaneseWordEntry token={t} kanji={displayData.kanji} key={`ja-${i}`} />
+    <div style={{ position: "fixed", left, top, pointerEvents: "none" }}>
+      <div
+        style={{
+          maxWidth: CARD_MAX_WIDTH,
+          backgroundColor: "rgba(26,26,46,0.95)",
+          border: "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 12,
+          padding: 16,
+          boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+          fontFamily: "system-ui, -apple-system, sans-serif",
+          color: "#e2e8f0",
+          opacity: visible ? 1 : 0,
+          transition: "opacity 150ms ease",
+          pointerEvents: "auto",
+        }}
+      >
+        {displayData.tokens
+          .filter((t) => t.is_content_word)
+          .map((t, i) => (
+            <JapaneseWordEntry token={t} kanji={uniqueKanji} key={`ja-${i}`} />
+          ))}
+        {displayData.translations.map((t, i) => (
+          <EnglishTranslationEntry translation={t} key={`en-${i}`} />
         ))}
-      {displayData.translations.map((t, i) => (
-        <EnglishTranslationEntry translation={t} key={`en-${i}`} />
-      ))}
+      </div>
     </div>
   );
 }

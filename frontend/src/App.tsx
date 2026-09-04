@@ -6,7 +6,7 @@ function App() {
   const { data, cursor } = useMouseTracker();
 
   return (
-    <div className="overlay">
+    <div className="overlay" style={{ pointerEvents: "none" }}>
       <HoverCard data={data} cursor={cursor} />
     </div>
   );

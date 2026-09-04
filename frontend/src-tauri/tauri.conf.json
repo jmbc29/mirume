@@ -17,9 +17,9 @@
         "height": 900,
         "transparent": true,
         "decorations": false,
-        "alwaysOnTop": true,
         "resizable": false,
-        "fullscreen": false
+        "fullscreen": false,
+        "visible": true
       }
     ],
     "macOSPrivateApi": true,

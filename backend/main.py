@@ -42,6 +42,7 @@ from datetime import date, datetime, timezone
 from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -117,6 +118,18 @@ app = FastAPI(
     description="Local backend for the Mirume Japanese-learning overlay.",
     version=API_VERSION,
     lifespan=lifespan,
+)
+
+# The overlay's webview runs on http://localhost:1420 (Tauri dev) and calls this
+# API on 127.0.0.1:8123 — a cross-origin pair, so WKWebView requires CORS headers
+# or it blocks the frontend from reading the response (the request still reaches
+# the server and logs 200, but `fetch` rejects). Everything here is loopback-only,
+# so a wildcard origin is fine.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

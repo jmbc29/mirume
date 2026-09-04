@@ -23,3 +23,9 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Used in `setup` to raise the overlay's NSWindow level and collection behaviour
+# so it floats above other apps' native fullscreen spaces. Versions and features
+# match what tao/wry already pull in, so this adds no extra build.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSWindow", "NSResponder"] }
+

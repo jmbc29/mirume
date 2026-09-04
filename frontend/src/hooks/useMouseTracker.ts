@@ -1,9 +1,16 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import type { HoverResponse } from "../types/hover";
 
 const HOVER_ENDPOINT = "http://127.0.0.1:8123/hover";
-const DEBOUNCE_MS = 300;
+const POLL_MS = 200;
 const MIN_MOVE_PX = 10;
+/**
+ * Once the cursor drifts more than this far from the point that triggered the
+ * last hover request, the card is stale — drop the data immediately so it
+ * disappears instead of lingering over unrelated screen content.
+ */
+const MAX_DRIFT_PX = 50;
 
 interface MouseTrackerState {
   data: HoverResponse | null;
@@ -21,9 +28,12 @@ export interface CursorPosition {
  * Tracks the cursor and calls the Mirume backend's /hover endpoint whenever
  * it settles somewhere new.
  *
- * Mouse movement is debounced by {@link DEBOUNCE_MS}: a hover request only
- * fires once the cursor has been still for that long, and only if it moved
- * more than {@link MIN_MOVE_PX} pixels since the last request.
+ * The overlay window is click-through (`set_ignore_cursor_events(true)`), so the
+ * webview never receives `mousemove` events while the cursor is over another
+ * app. Instead we poll the `get_cursor_position` Rust command every
+ * {@link POLL_MS}ms for the real global cursor position (top-left-origin logical
+ * screen points), and fire a hover request only once the cursor has moved more
+ * than {@link MIN_MOVE_PX} pixels from the last request.
  */
 export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition } {
   const [state, setState] = useState<MouseTrackerState>({
@@ -34,21 +44,10 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
   const [cursor, setCursor] = useState<CursorPosition>({ x: 0, y: 0 });
 
   const lastCalledRef = useRef<CursorPosition | null>(null);
-  const latestRef = useRef<CursorPosition>({ x: 0, y: 0 });
-  const timeoutRef = useRef<number | undefined>(undefined);
   const requestIdRef = useRef(0);
 
   useEffect(() => {
-    const handleMouseMove = (event: MouseEvent) => {
-      const position = { x: event.screenX, y: event.screenY };
-      latestRef.current = position;
-      setCursor(position);
-
-      window.clearTimeout(timeoutRef.current);
-      timeoutRef.current = window.setTimeout(() => {
-        void maybeFetchHover(latestRef.current);
-      }, DEBOUNCE_MS);
-    };
+    let cancelled = false;
 
     const maybeFetchHover = async (position: CursorPosition) => {
       const last = lastCalledRef.current;
@@ -83,10 +82,35 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
       }
     };
 
-    window.addEventListener("mousemove", handleMouseMove);
+    const poll = async () => {
+      let position: CursorPosition;
+      try {
+        const [x, y] = await invoke<[number, number]>("get_cursor_position");
+        position = { x, y };
+      } catch {
+        // Not running inside Tauri (e.g. plain browser dev) — nothing to poll.
+        return;
+      }
+      if (cancelled) return;
+      setCursor(position);
+
+      // If the cursor has moved well away from where the visible card was
+      // triggered, hide it right away rather than waiting for the next request.
+      const last = lastCalledRef.current;
+      if (last) {
+        const drift = Math.hypot(position.x - last.x, position.y - last.y);
+        if (drift > MAX_DRIFT_PX) {
+          setState((prev) => (prev.data ? { ...prev, data: null } : prev));
+        }
+      }
+
+      void maybeFetchHover(position);
+    };
+
+    const intervalId = window.setInterval(() => void poll(), POLL_MS);
     return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.clearTimeout(timeoutRef.current);
+      cancelled = true;
+      window.clearInterval(intervalId);
     };
   }, []);
 
