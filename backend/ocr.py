@@ -10,7 +10,11 @@ pages) and does well on the short, mixed-font runs typical of web text.
 Public API:
 
 * :func:`capture_region` – screenshot a rectangle of the screen as a
-  :class:`PIL.Image.Image`.
+  :class:`PIL.Image.Image`, via the ``screencapture`` CLI. It grabs the
+  *composited* display exactly as the user sees it, so Mirume's own
+  transparent full-screen overlay contributes nothing and the web content
+  underneath shows through (``CGWindowListCreateImage`` composited the empty
+  overlay on top instead, yielding the desktop wallpaper).
 * :func:`extract_text_at_position` – OCR a region centred on a screen
   coordinate; returns the text only when it actually contains Japanese.
 
@@ -25,7 +29,9 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import sys
+import tempfile
 
 # manga-ocr / huggingface_hub default to the Xet transfer protocol, which has
 # been seen to stall indefinitely on the first weights download behind some
@@ -34,31 +40,10 @@ import sys
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 # --------------------------------------------------------------------------- #
-# Optional-dependency guards. manga-ocr pulls in torch/transformers and Quartz
-# is macOS-only; the module must still import (degrading to "no OCR") when
-# either is missing so the rest of the backend keeps working.
+# Optional-dependency guard. manga-ocr pulls in torch/transformers; the module
+# must still import (degrading to "no OCR") when it or Pillow is missing so the
+# rest of the backend keeps working.
 # --------------------------------------------------------------------------- #
-
-_QUARTZ_AVAILABLE = True
-try:  # pragma: no cover - platform dependent
-    from Quartz import (
-        CGMainDisplayID,
-        CGRectMake,
-        CGWindowListCreateImage,
-        kCGNullWindowID,
-        kCGWindowImageDefault,
-        kCGWindowListOptionOnScreenOnly,
-    )
-    from Quartz.CoreGraphics import (
-        CGDataProviderCopyData,
-        CGImageGetDataProvider,
-        CGImageGetHeight,
-        CGImageGetWidth,
-        CGImageGetBytesPerRow,
-    )
-except Exception as exc:  # pragma: no cover - platform dependent
-    _QUARTZ_AVAILABLE = False
-    _QUARTZ_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 try:
     from PIL import Image, ImageGrab
@@ -72,9 +57,6 @@ except Exception as exc:  # pragma: no cover - dependency missing
 # Constants
 # --------------------------------------------------------------------------- #
 
-#: Default capture size for :func:`capture_region` (width, height) in points.
-_DEFAULT_REGION = (300, 80)
-
 #: Region OCR'd by :func:`extract_text_at_position`, centred on the cursor.
 _OCR_REGION_WIDTH = 400
 _OCR_REGION_HEIGHT = 100
@@ -84,6 +66,10 @@ _OCR_REGION_HEIGHT = 100
 #: (kanji). If an OCR result contains none of these it is noise (manga-ocr
 #: hallucinates short Latin strings on empty or dark backgrounds) and we drop it.
 _JAPANESE_RE = re.compile(r"[぀-鿿]")
+
+#: Set once we've warned that ``screencapture`` is failing (almost always a
+#: missing Screen Recording grant), so the log isn't spammed on every hover.
+_capture_warned = False
 
 #: manga-ocr always returns *some* string, and on a near-uniform region (a
 #: blank wall of colour, an empty margin) that string is a plausible-looking
@@ -134,33 +120,55 @@ def _get_model():
 # --------------------------------------------------------------------------- #
 
 
-def _cgimage_to_pil(cg_image) -> "Image.Image | None":
-    """Convert a ``CGImageRef`` to a :class:`PIL.Image.Image` (RGB)."""
+def _screencapture_region(left: int, top: int, width: int, height: int) -> "Image.Image | None":
+    """Run ``screencapture -x -R`` for one rectangle and load the PNG it writes.
+
+    ``screencapture`` captures the composited framebuffer — what is actually on
+    screen — so a transparent window (Mirume's overlay) contributes nothing and
+    the app underneath is what gets grabbed.
+    """
+    global _capture_warned
     if Image is None:
         return None
-    width = CGImageGetWidth(cg_image)
-    height = CGImageGetHeight(cg_image)
-    if width == 0 or height == 0:
+    fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="mirume-ocr-")
+    os.close(fd)
+    try:
+        proc = subprocess.run(
+            ["screencapture", "-x", "-R", f"{left},{top},{width},{height}", tmp_path],
+            capture_output=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            if not _capture_warned:
+                _capture_warned = True
+                err = proc.stderr.decode("utf-8", "replace").strip()
+                print(
+                    f"[mirume] screencapture failed ({err or 'unknown error'}). "
+                    "OCR fallback needs Screen Recording permission — grant it in "
+                    "System Settings > Privacy & Security > Screen Recording for "
+                    "the app that launches the backend (Terminal/iTerm), then "
+                    "fully quit and reopen it."
+                )
+            return None
+        with Image.open(tmp_path) as image:
+            image.load()
+            return image.copy()
+    except (subprocess.SubprocessError, OSError, ValueError):
         return None
-    bytes_per_row = CGImageGetBytesPerRow(cg_image)
-    provider = CGImageGetDataProvider(cg_image)
-    data = CGDataProviderCopyData(provider)
-    buffer = bytes(data)
-    # CGWindowListCreateImage hands back premultiplied BGRA, one row every
-    # ``bytes_per_row`` bytes (which may be padded past ``width * 4``).
-    image = Image.frombuffer(
-        "RGBA", (width, height), buffer, "raw", "BGRA", bytes_per_row, 1
-    )
-    return image.convert("RGB")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def capture_region(x: float, y: float, width: int = 300, height: int = 80) -> "Image.Image | None":
     """Screenshot a ``width`` x ``height`` rectangle whose top-left is ``(x, y)``.
 
     Coordinates are top-left-origin screen points (the same convention as the
-    Accessibility API and the cursor poller). Tries the Quartz
-    ``CGWindowListCreateImage`` path first — it captures on-screen window
-    content without stealing focus — and falls back to :func:`PIL.ImageGrab.grab`.
+    Accessibility API and the cursor poller). Uses the ``screencapture`` CLI —
+    which grabs the composited display, seeing past Mirume's transparent
+    overlay — and falls back to :func:`PIL.ImageGrab.grab`.
 
     Args:
         x: Left edge of the region, in screen points.
@@ -169,39 +177,28 @@ def capture_region(x: float, y: float, width: int = 300, height: int = 80) -> "I
         height: Region height in points.
 
     Returns:
-        The captured image (RGB), or ``None`` if screen capture is unavailable
-        or permission (Screen Recording) has not been granted.
+        The captured image (RGB), or ``None`` if screen capture failed or
+        Screen Recording permission has not been granted.
     """
-    left, top = int(x), int(y)
-    right, bottom = left + int(width), top + int(height)
+    left, top = int(round(x)), int(round(y))
+    w, h = max(1, int(round(width))), max(1, int(round(height)))
 
-    if _QUARTZ_AVAILABLE:
+    image = _screencapture_region(left, top, w, h)
+    if image is None and ImageGrab is not None:
         try:
-            rect = CGRectMake(left, top, int(width), int(height))
-            cg_image = CGWindowListCreateImage(
-                rect,
-                kCGWindowListOptionOnScreenOnly,
-                kCGNullWindowID,
-                kCGWindowImageDefault,
-            )
-            if cg_image is not None:
-                pil = _cgimage_to_pil(cg_image)
-                if pil is not None:
-                    # Retina displays hand back a 2x pixel buffer for the same
-                    # point rect; normalise back to the requested point size so
-                    # OCR sees a consistent scale.
-                    if pil.width > int(width) or pil.height > int(height):
-                        pil = pil.resize((int(width), int(height)), Image.LANCZOS)
-                    return pil
+            image = ImageGrab.grab(bbox=(left, top, left + w, top + h))
         except Exception:
-            pass  # fall through to ImageGrab
+            image = None
+    if image is None:
+        return None
 
-    if ImageGrab is not None:
-        try:
-            return ImageGrab.grab(bbox=(left, top, right, bottom)).convert("RGB")
-        except Exception:
-            return None
-    return None
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    # Retina displays hand back a 2x pixel buffer for a point-sized region;
+    # normalise to the requested point size so OCR sees a consistent scale.
+    if image.width > w or image.height > h:
+        image = image.resize((w, h), Image.LANCZOS)
+    return image
 
 
 # --------------------------------------------------------------------------- #
