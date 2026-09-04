@@ -8,6 +8,8 @@ content the AX tree does not expose.
 Public API:
 
 * :func:`get_text_at_position` – text of the element under a screen coordinate.
+* :func:`get_text_with_ocr_fallback` – as above, falling back to screenshot OCR
+  (:mod:`ocr`) for content the AX tree does not expose.
 * :func:`get_focused_text` – text of the currently focused element (fallback).
 * :func:`accessibility_permission_granted` – is AX access allowed for this
   process (optionally triggering the system prompt).
@@ -287,6 +289,36 @@ def get_focused_text() -> str | None:
         return _extract_text(focused)
     except Exception:
         return None
+
+
+def get_text_with_ocr_fallback(x: float, y: float) -> tuple[str | None, str]:
+    """Return the text under ``(x, y)`` and how it was obtained.
+
+    Tries the Accessibility API first (fast, exact, but blind to sandboxed
+    renderers like Chrome's web content). If that finds nothing, falls back to
+    a screenshot + manga-ocr pass (:func:`ocr.extract_text_at_position`).
+
+    Args:
+        x: Horizontal screen coordinate (top-left origin, points).
+        y: Vertical screen coordinate.
+
+    Returns:
+        ``(text, "accessibility")`` if the AX tree had text, ``(text, "ocr")``
+        if OCR recovered it, or ``(None, "none")`` if both failed.
+    """
+    ax_text = get_text_at_position(x, y)
+    if ax_text:
+        return ax_text, "accessibility"
+
+    try:
+        from ocr import extract_text_at_position
+    except Exception:
+        return None, "none"
+
+    ocr_text = extract_text_at_position(x, y)
+    if ocr_text:
+        return ocr_text, "ocr"
+    return None, "none"
 
 
 def current_mouse_position() -> tuple[float, float]:

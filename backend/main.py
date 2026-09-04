@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import AsyncIterator
@@ -50,7 +51,7 @@ from sqlalchemy.orm import Session
 from accessibility import (
     accessibility_permission_granted,
     get_focused_text,
-    get_text_at_position,
+    get_text_with_ocr_fallback,
 )
 from database import JMDICT_DB_PATH, MIRUME_DB_PATH, get_mirume_session, init_databases
 from jlpt import (
@@ -110,6 +111,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "[mirume] Add it to backend/.env (get a free-tier key at "
             "https://www.deepl.com/pro-api).\n"
         )
+
+    # Warm up the OCR fallback: loading the manga-ocr model takes 2-3 s (and a
+    # one-time ~440 MB weights download), so kick it off now rather than on the
+    # first Chrome hover. Runs on a daemon thread so a slow/absent network never
+    # blocks startup; the (0, 0) capture yields no Japanese and is discarded —
+    # we only want the model resident in memory.
+    def _warm_ocr() -> None:
+        try:
+            from ocr import extract_text_at_position
+
+            extract_text_at_position(0, 0)
+        except Exception as exc:  # pragma: no cover - model/deps optional
+            print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
+                  "slow on first use or unavailable.")
+
+    threading.Thread(target=_warm_ocr, name="ocr-warmup", daemon=True).start()
+
     yield
 
 
@@ -274,9 +292,9 @@ class HoverResponse(BaseModel):
 
     text: str = Field(description="Detected text under the cursor.")
     source: str = Field(
-        description="How the text was obtained: 'accessibility' (real screen "
-        "text), 'placeholder' (fallback — nothing detected or no permission), "
-        "or 'ocr' (not implemented yet)."
+        description="How the text was obtained: 'accessibility' (AX tree text), "
+        "'ocr' (screenshot + manga-ocr, used for sandboxed content like Chrome "
+        "web pages), or 'placeholder' (nothing detected / no permission)."
     )
     language: str = Field(
         description="Detected language of the text: 'ja', 'en', or 'mixed'."
@@ -513,11 +531,15 @@ def hover(request: HoverRequest) -> HoverResponse:
         obtained (``"accessibility"`` vs ``"placeholder"``); ``language``
         describes what was found there (``"ja"``, ``"en"`` or ``"mixed"``).
     """
-    detected = get_text_at_position(request.x, request.y) or get_focused_text()
+    detected, detection_source = get_text_with_ocr_fallback(request.x, request.y)
     if not detected:
-        # Nothing under the cursor (or no Accessibility permission). Return an
-        # empty response rather than the placeholder sentence, so the frontend
-        # keeps the hover card hidden instead of showing it over everything.
+        detected = get_focused_text()
+        detection_source = "accessibility" if detected else "none"
+
+    if not detected:
+        # Nothing under the cursor from AX, OCR, or the focused element (or no
+        # permission). Return an empty response rather than a placeholder
+        # sentence, so the frontend keeps the hover card hidden.
         return HoverResponse(
             text="",
             source="placeholder",
@@ -527,7 +549,7 @@ def hover(request: HoverRequest) -> HoverResponse:
             kanji=[],
             translations=[],
         )
-    text, source = detected, "accessibility"
+    text, source = detected, detection_source
 
     segments = _segment_by_script(text)
     scripts_present = {kind for kind, segment in segments}
