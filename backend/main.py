@@ -633,7 +633,12 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
                 continue
             translations.append(TranslationOut.from_result(segment, result))
 
-    kanji = [KanjiOut.from_kanji_info(k) for k in get_kanji_breakdown(text)]
+    # get_kanji_breakdown() already dedupes by literal internally; this second
+    # pass guarantees the /hover response itself never carries a duplicate
+    # literal even if that internal guarantee ever regresses.
+    kanji = list(
+        {k.literal: k for k in (KanjiOut.from_kanji_info(k) for k in get_kanji_breakdown(text))}.values()
+    )
     return HoverResponse(
         text=text,
         source=source,

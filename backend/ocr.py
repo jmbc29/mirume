@@ -16,10 +16,14 @@ Public API:
   underneath shows through (``CGWindowListCreateImage`` composited the empty
   overlay on top instead, yielding the desktop wallpaper).
 * :func:`extract_text_at_position` – OCR a region centred on a screen
-  coordinate; returns the text only when it actually contains Japanese and
-  the frontmost app isn't a dev tool (see :data:`_OCR_BLOCKED_APPS`).
+  coordinate; returns the text only when it actually contains Japanese, the
+  frontmost app isn't a dev tool (see :data:`_OCR_BLOCKED_APPS`), and — when
+  the frontmost app is Chrome — the active tab isn't an AI chat site (see
+  :data:`_BLOCKED_DOMAINS`).
 * :func:`get_frontmost_app` – name of the active application, used to gate
   OCR off code editors/terminals whose own UI text isn't meant to be read.
+* :func:`get_chrome_url` – active tab URL when Chrome is frontmost, used to
+  tell an actual webpage apart from an AI chat site running in the browser.
 
 The model weights (~400 MB) download once on first use and are then cached by
 ``huggingface_hub``. Loading them into memory takes 2-3 s, so the first call is
@@ -125,6 +129,20 @@ _OCR_BLOCKED_APPS: frozenset[str] = frozenset(
         "Cursor",
         "claude",
         "Claude",
+    }
+)
+
+#: Substrings matched against the active Chrome tab's URL (lowercased) to
+#: block OCR on — AI chat sites where Mirume would otherwise treat the
+#: assistant's Japanese-language replies as text to classify, plus localhost,
+#: which is almost always this project's own dev servers.
+_BLOCKED_DOMAINS: frozenset[str] = frozenset(
+    {
+        "claude.ai",
+        "chat.openai.com",
+        "chatgpt.com",
+        "localhost",
+        "127.0.0.1",
     }
 )
 
@@ -321,6 +339,39 @@ def get_frontmost_app() -> str:
         return ""
 
 
+def get_chrome_url() -> str:
+    """Return the URL of Chrome's active tab, lowercased.
+
+    Used to keep OCR off AI chat sites (:data:`_BLOCKED_DOMAINS`) — the
+    frontmost-app check alone sees "Google Chrome" for every website, so it
+    can't tell NHK news apart from a chat with Claude. Shells out to Chrome
+    via ``osascript``; bounded by a 1 s timeout for the same reason as
+    :func:`get_frontmost_app`. Only meaningful (and only ever called) while
+    Chrome is frontmost — asking a backgrounded Chrome for its URL still
+    works, but there's no reason to pay the round-trip when it isn't.
+
+    Returns:
+        The active tab's URL, lowercased, or ``""`` if it could not be
+        determined (Chrome isn't running, AppleScript is disabled for it, or
+        the call times out).
+    """
+    script = """
+    tell application "Google Chrome"
+        return URL of active tab of front window
+    end tell
+    """
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return result.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -358,8 +409,9 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     Returns:
         The recognised text, stripped, or ``None`` when nothing was captured,
         the model is unavailable or busy, the frontmost app is a blocked dev
-        tool (:data:`_OCR_BLOCKED_APPS`), the region is too low-contrast to
-        hold text, the result is shorter than 2 characters, or fewer than
+        tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is a blocked AI
+        chat site (:data:`_BLOCKED_DOMAINS`), the region is too low-contrast
+        to hold text, the result is shorter than 2 characters, or fewer than
         :data:`_MIN_JAPANESE_DENSITY` of the result's characters are Japanese
         (hiragana / katakana / kanji). manga-ocr always emits *something* — a
         low-contrast capture or a result that's mostly non-Japanese noise is
@@ -385,8 +437,17 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     # the AX tree misses still isn't web content). Checked here rather than
     # before the model load so the startup warmup call still loads the model
     # into memory regardless of what's frontmost at that moment.
-    if get_frontmost_app() in _OCR_BLOCKED_APPS:
+    frontmost = get_frontmost_app()
+    if frontmost in _OCR_BLOCKED_APPS:
         return None
+
+    # The app-level check above sees "Google Chrome" for every website, so
+    # AI chat sites need a second, URL-based gate — otherwise Mirume reads
+    # Claude's own Japanese-language replies as text to classify.
+    if frontmost == "Google Chrome":
+        url = get_chrome_url()
+        if any(blocked in url for blocked in _BLOCKED_DOMAINS):
+            return None
 
     if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
         return None
