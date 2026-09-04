@@ -23,8 +23,15 @@ real hover is fast.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
+
+# manga-ocr / huggingface_hub default to the Xet transfer protocol, which has
+# been seen to stall indefinitely on the first weights download behind some
+# networks. Fall back to plain HTTPS range downloads unless the operator opts
+# back in. Must be set before `manga_ocr`/`huggingface_hub` are imported.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 # --------------------------------------------------------------------------- #
 # Optional-dependency guards. manga-ocr pulls in torch/transformers and Quartz
@@ -77,6 +84,13 @@ _OCR_REGION_HEIGHT = 100
 #: (kanji). If an OCR result contains none of these it is noise (manga-ocr
 #: hallucinates short Latin strings on empty or dark backgrounds) and we drop it.
 _JAPANESE_RE = re.compile(r"[぀-鿿]")
+
+#: manga-ocr always returns *some* string, and on a near-uniform region (a
+#: blank wall of colour, an empty margin) that string is a plausible-looking
+#: Japanese hallucination. Skip OCR entirely when the captured region has too
+#: little tonal contrast to contain rendered text — measured as the spread
+#: between the 5th and 95th percentile of greyscale pixel values (0-255).
+_MIN_CONTRAST_RANGE = 40
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +209,28 @@ def capture_region(x: float, y: float, width: int = 300, height: int = 80) -> "I
 # --------------------------------------------------------------------------- #
 
 
+def _has_text_contrast(image: "Image.Image") -> bool:
+    """Return whether ``image`` has enough tonal range to contain rendered text.
+
+    A near-uniform region (blank background, empty margin) makes manga-ocr
+    hallucinate; we'd rather return nothing there.
+    """
+    histogram = image.convert("L").histogram()
+    total = sum(histogram)
+    if total == 0:
+        return False
+    lo_cut, hi_cut = total * 0.05, total * 0.95
+    running = 0
+    lo = hi = 0
+    for value, count in enumerate(histogram):
+        running += count
+        if running <= lo_cut:
+            lo = value
+        if running <= hi_cut:
+            hi = value
+    return (hi - lo) >= _MIN_CONTRAST_RANGE
+
+
 def extract_text_at_position(x: float, y: float) -> str | None:
     """OCR a 400x100 region centred on ``(x, y)`` and return any Japanese text.
 
@@ -204,10 +240,10 @@ def extract_text_at_position(x: float, y: float) -> str | None:
 
     Returns:
         The recognised text, stripped, or ``None`` when nothing was captured,
-        the model is unavailable, or the result contains no Japanese
-        characters (hiragana / katakana / kanji). manga-ocr emits short
-        spurious Latin strings on blank or dark backgrounds, so a
-        Japanese-free result is treated as "no text here".
+        the model is unavailable, the region is too low-contrast to hold text,
+        or the result contains no Japanese characters (hiragana / katakana /
+        kanji). manga-ocr always emits *something* — a Japanese-free or
+        low-contrast result is treated as "no text here".
     """
     model = _get_model()
     if model is None:
@@ -216,7 +252,7 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     left = x - _OCR_REGION_WIDTH / 2
     top = y - _OCR_REGION_HEIGHT / 2
     image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
-    if image is None:
+    if image is None or not _has_text_contrast(image):
         return None
 
     try:
