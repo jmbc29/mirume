@@ -16,7 +16,10 @@ Public API:
   underneath shows through (``CGWindowListCreateImage`` composited the empty
   overlay on top instead, yielding the desktop wallpaper).
 * :func:`extract_text_at_position` – OCR a region centred on a screen
-  coordinate; returns the text only when it actually contains Japanese.
+  coordinate; returns the text only when it actually contains Japanese and
+  the frontmost app isn't a dev tool (see :data:`_OCR_BLOCKED_APPS`).
+* :func:`get_frontmost_app` – name of the active application, used to gate
+  OCR off code editors/terminals whose own UI text isn't meant to be read.
 
 The model weights (~400 MB) download once on first use and are then cached by
 ``huggingface_hub``. Loading them into memory takes 2-3 s, so the first call is
@@ -98,13 +101,32 @@ _capture_warned = False
 #: Japanese hallucination. Skip OCR entirely when the captured region has too
 #: little tonal contrast to contain rendered text — measured as the spread
 #: between the 5th and 95th percentile of greyscale pixel values (0-255).
-_MIN_CONTRAST_RANGE = 60
+_MIN_CONTRAST_RANGE = 70
 
 #: Minimum fraction of non-whitespace characters in an OCR result that must be
 #: Japanese for the result to be trusted. manga-ocr sometimes locks onto a
 #: sliver of nearby English/UI text at the edge of the capture region; a
 #: result that's mostly non-Japanese is more likely noise than a real word.
-_MIN_JAPANESE_DENSITY = 0.3
+_MIN_JAPANESE_DENSITY = 0.4
+
+#: App process names (as reported by System Events, i.e. what
+#: :func:`get_frontmost_app` returns) where OCR should never run: dev tools
+#: and terminals the user is likely to have Mirume's own backend open in, plus
+#: Claude itself. A blocklist rather than an allowlist of browsers, so OCR
+#: still works in any browser / PDF viewer / other app we haven't thought to
+#: list — only the apps below are actively excluded.
+_OCR_BLOCKED_APPS: frozenset[str] = frozenset(
+    {
+        "Code",  # VS Code
+        "Terminal",
+        "iTerm2",
+        "Xcode",
+        "cursor",
+        "Cursor",
+        "claude",
+        "Claude",
+    }
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +285,43 @@ def capture_region(x: float, y: float, width: int = 300, height: int = 80) -> "I
 
 
 # --------------------------------------------------------------------------- #
+# Frontmost-app gating
+# --------------------------------------------------------------------------- #
+
+
+def get_frontmost_app() -> str:
+    """Return the name of the frontmost (active) application.
+
+    Used to keep OCR off the user's own dev tools and this backend's
+    terminal — see :data:`_OCR_BLOCKED_APPS` — since the AX API alone can't
+    tell OCR-worthy sandboxed web content (Chrome) apart from a code editor
+    that also happens to render its own text in a way the AX tree misses.
+    Shells out to System Events via ``osascript``; bounded by a 1 s timeout so
+    a slow/wedged AppleScript round-trip never turns into a hung hover.
+
+    Returns:
+        The frontmost app's process name (e.g. ``"Google Chrome"``), or
+        ``""`` if it could not be determined.
+    """
+    script = """
+    tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+        return frontApp
+    end tell
+    """
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 
@@ -298,11 +357,13 @@ def extract_text_at_position(x: float, y: float) -> str | None:
 
     Returns:
         The recognised text, stripped, or ``None`` when nothing was captured,
-        the model is unavailable or busy, the region is too low-contrast to
-        hold text, or fewer than :data:`_MIN_JAPANESE_DENSITY` of the result's
-        characters are Japanese (hiragana / katakana / kanji). manga-ocr
-        always emits *something* — a low-contrast capture or a result that's
-        mostly non-Japanese noise is treated as "no text here".
+        the model is unavailable or busy, the frontmost app is a blocked dev
+        tool (:data:`_OCR_BLOCKED_APPS`), the region is too low-contrast to
+        hold text, the result is shorter than 2 characters, or fewer than
+        :data:`_MIN_JAPANESE_DENSITY` of the result's characters are Japanese
+        (hiragana / katakana / kanji). manga-ocr always emits *something* — a
+        low-contrast capture or a result that's mostly non-Japanese noise is
+        treated as "no text here".
 
     Concurrency: manga-ocr / torch-MPS inference is **not** reentrant — two
     overlapping calls crash the whole worker process (silently, with no
@@ -317,6 +378,14 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     """
     model = _get_model()
     if model is None:
+        return None
+
+    # Gated on the frontmost app, not just cursor position: dev tools and
+    # this backend's own terminal are never a valid OCR target (VS Code text
+    # the AX tree misses still isn't web content). Checked here rather than
+    # before the model load so the startup warmup call still loads the model
+    # into memory regardless of what's frontmost at that moment.
+    if get_frontmost_app() in _OCR_BLOCKED_APPS:
         return None
 
     if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
@@ -335,7 +404,7 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         _infer_lock.release()
 
     text = (text or "").strip()
-    if not text:
+    if len(text) < 2:
         return None
     japanese_chars = len(_JAPANESE_RE.findall(text))
     if japanese_chars / len(text) < _MIN_JAPANESE_DENSITY:

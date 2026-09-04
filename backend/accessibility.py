@@ -296,7 +296,11 @@ def get_text_with_ocr_fallback(x: float, y: float) -> tuple[str | None, str]:
 
     Tries the Accessibility API first (fast, exact, but blind to sandboxed
     renderers like Chrome's web content). If that finds nothing, falls back to
-    a screenshot + manga-ocr pass (:func:`ocr.extract_text_at_position`).
+    a screenshot + manga-ocr pass (:func:`ocr.extract_text_at_position`) —
+    but only when the frontmost app isn't a dev tool / terminal
+    (``ocr._OCR_BLOCKED_APPS``), since OCR has no way to tell "sandboxed web
+    content the AX tree can't see" apart from "a code editor's own UI text
+    the AX tree also happens to miss".
 
     Args:
         x: Horizontal screen coordinate (top-left origin, points).
@@ -304,15 +308,19 @@ def get_text_with_ocr_fallback(x: float, y: float) -> tuple[str | None, str]:
 
     Returns:
         ``(text, "accessibility")`` if the AX tree had text, ``(text, "ocr")``
-        if OCR recovered it, or ``(None, "none")`` if both failed.
+        if OCR recovered it, or ``(None, "none")`` if both failed or the
+        frontmost app is blocked from OCR.
     """
     ax_text = get_text_at_position(x, y)
     if ax_text:
         return ax_text, "accessibility"
 
     try:
-        from ocr import extract_text_at_position
+        from ocr import _OCR_BLOCKED_APPS, extract_text_at_position, get_frontmost_app
     except Exception:
+        return None, "none"
+
+    if get_frontmost_app() in _OCR_BLOCKED_APPS:
         return None, "none"
 
     ocr_text = extract_text_at_position(x, y)
