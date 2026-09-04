@@ -3,9 +3,15 @@
 The macOS Accessibility API (:mod:`accessibility`) cannot see inside a
 sandboxed renderer — Chrome, Electron apps, canvas/WebGL content, video — so
 for that content ``/hover`` falls back to grabbing a small screenshot around
-the cursor and running `manga-ocr <https://github.com/kha-white/manga-ocr>`_
-over it. manga-ocr is a Japanese-specific recognition model (trained on manga
-pages) and does well on the short, mixed-font runs typical of web text.
+the cursor and running `PaddleOCR <https://github.com/PaddlePaddle/PaddleOCR>`_
+over it. PaddleOCR runs as a two-stage pipeline — a detection model that finds
+each line of text's exact bounding box, then a recognition model that reads
+only the pixels inside each box — which is what this module is built around:
+of everything detected in the captured region, only the box closest to the
+cursor is returned. This replaced `manga-ocr <https://github.com/kha-white/manga-ocr>`_,
+which read the captured region as a single blob of text and would blend
+together unrelated nearby UI elements on a dense page (its output looked like
+a hallucination but was really just several fragments run together).
 
 Public API:
 
@@ -16,20 +22,22 @@ Public API:
   underneath shows through (``CGWindowListCreateImage`` composited the empty
   overlay on top instead, yielding the desktop wallpaper).
 * :func:`extract_text_at_position` – OCR a region centred on a screen
-  coordinate; returns the text only when it actually contains Japanese, the
-  frontmost app isn't a dev tool (see :data:`_OCR_BLOCKED_APPS`), and — when
-  the frontmost app is Chrome — the active tab isn't an AI chat site (see
-  :data:`_BLOCKED_DOMAINS`).
+  coordinate; returns the text of whichever detected line sits closest to the
+  cursor, when it actually contains Japanese, the frontmost app isn't a dev
+  tool (see :data:`_OCR_BLOCKED_APPS`), and — when the frontmost app is
+  Chrome — the active tab isn't an AI chat site (see :data:`_BLOCKED_DOMAINS`).
 * :func:`get_frontmost_app` – name of the active application, used to gate
   OCR off code editors/terminals whose own UI text isn't meant to be read.
 * :func:`get_chrome_url` – active tab URL when Chrome is frontmost, used to
   tell an actual webpage apart from an AI chat site running in the browser.
 
-The model weights (~400 MB) download once on first use and are then cached by
-``huggingface_hub``. Loading them into memory takes 2-3 s, so the first call is
-slow; :func:`extract_text_at_position` loads lazily and caches the model for
-every call after. The backend calls it once during startup warmup so the first
-real hover is fast.
+The detection + recognition model weights (~150 MB total) download once on
+first use into ``~/.paddlex/official_models`` and are cached there by
+``paddlex``. Loading them into memory is slow (several seconds on a cold
+cache, longer the very first time while the weights download), so
+:func:`extract_text_at_position` loads lazily and caches the model for every
+call after. The backend calls it once during startup warmup so the first real
+hover is fast.
 """
 
 from __future__ import annotations
@@ -41,16 +49,12 @@ import sys
 import tempfile
 import threading
 
-# manga-ocr / huggingface_hub default to the Xet transfer protocol, which has
-# been seen to stall indefinitely on the first weights download behind some
-# networks. Fall back to plain HTTPS range downloads unless the operator opts
-# back in. Must be set before `manga_ocr`/`huggingface_hub` are imported.
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+import numpy as np
 
 # --------------------------------------------------------------------------- #
-# Optional-dependency guard. manga-ocr pulls in torch/transformers; the module
-# must still import (degrading to "no OCR") when it or Pillow is missing so the
-# rest of the backend keeps working.
+# Optional-dependency guard. paddleocr pulls in paddlepaddle, a full ML
+# runtime; the module must still import (degrading to "no OCR") when it or
+# Pillow is missing so the rest of the backend keeps working.
 # --------------------------------------------------------------------------- #
 
 try:
@@ -74,8 +78,11 @@ except Exception as exc:  # pragma: no cover - dependency missing
 # --------------------------------------------------------------------------- #
 
 #: Region OCR'd by :func:`extract_text_at_position`, centred on the cursor.
+#: Taller than the old manga-ocr region (400x100) since PaddleOCR's detector
+#: needs enough vertical room to isolate the line the cursor is on from the
+#: lines immediately above/below it, rather than reading everything at once.
 _OCR_REGION_WIDTH = 400
-_OCR_REGION_HEIGHT = 100
+_OCR_REGION_HEIGHT = 200
 
 #: Hard ceiling on the ``screencapture`` CLI. It normally returns in well under
 #: 200 ms; anything longer means it is wedged (a permission prompt, a stuck
@@ -84,34 +91,31 @@ _SCREENCAPTURE_TIMEOUT_S = 2.0
 
 #: How long :func:`extract_text_at_position` waits for the shared inference
 #: slot before giving up on this hover. Capture (~200 ms, or the 2 s
-#: ``screencapture`` timeout) plus inference (~0.5 s) is the normal hold time,
-#: so a wait longer than this means calls are stacking up faster than manga-ocr
-#: can drain them and it is better to skip.
+#: ``screencapture`` timeout) plus inference (~300 ms) is the normal hold
+#: time, so a wait longer than this means calls are stacking up faster than
+#: PaddleOCR can drain them and it is better to skip.
 _OCR_LOCK_WAIT_S = 2.5
 
 #: Codepoint range that counts as "Japanese" — U+3040..U+9FFF spans hiragana,
 #: katakana, the CJK symbols/punctuation block and the CJK unified ideographs
-#: (kanji). Used both to reject results with none of these (manga-ocr
-#: hallucinates short Latin strings on empty or dark backgrounds) and to check
-#: what fraction of a result is actually Japanese (see _MIN_JAPANESE_DENSITY).
+#: (kanji). Used to reject a detected line with none of these — PaddleOCR's
+#: recognition model still emits its best guess for a box the detector found,
+#: even when that box turns out to be non-Japanese UI text.
 _JAPANESE_RE = re.compile(r"[぀-鿿]")
 
 #: Set once we've warned that ``screencapture`` is failing (almost always a
 #: missing Screen Recording grant), so the log isn't spammed on every hover.
 _capture_warned = False
 
-#: manga-ocr always returns *some* string, and on a near-uniform region (a
-#: blank wall of colour, an empty margin) that string is a plausible-looking
-#: Japanese hallucination. Skip OCR entirely when the captured region has too
-#: little tonal contrast to contain rendered text — measured as the spread
-#: between the 5th and 95th percentile of greyscale pixel values (0-255).
+#: Skip OCR entirely when the captured region has too little tonal contrast to
+#: contain rendered text — measured as the spread between the 5th and 95th
+#: percentile of greyscale pixel values (0-255). Detection-based OCR won't
+#: hallucinate text on a blank region the way manga-ocr did, but running the
+#: full detect+recognise pipeline over an empty margin is still wasted work.
 _MIN_CONTRAST_RANGE = 70
 
-#: Minimum fraction of non-whitespace characters in an OCR result that must be
-#: Japanese for the result to be trusted. manga-ocr sometimes locks onto a
-#: sliver of nearby English/UI text at the edge of the capture region; a
-#: result that's mostly non-Japanese is more likely noise than a real word.
-_MIN_JAPANESE_DENSITY = 0.4
+#: Minimum recognition confidence (0-1) for a detected line to be trusted.
+_MIN_OCR_CONFIDENCE = 0.7
 
 #: App process names (as reported by System Events, i.e. what
 #: :func:`get_frontmost_app` returns) where OCR should never run: dev tools
@@ -151,54 +155,63 @@ _BLOCKED_DOMAINS: frozenset[str] = frozenset(
 # Lazy model loader
 # --------------------------------------------------------------------------- #
 
-_mocr = None  # cached manga_ocr.MangaOcr instance
-_mocr_failed = False
-_mocr_lock = threading.Lock()  # serialise the one-time load across threads
+_ocr_instance = None  # cached paddleocr.PaddleOCR instance
+_ocr_load_failed = False
+_model_lock = threading.Lock()  # serialise the one-time load across threads
 
-#: Held for the duration of every capture + manga-ocr inference. torch-MPS
-#: inference is not reentrant — concurrent calls abort the worker process — so
-#: OCR is strictly serialised process-wide. See :func:`extract_text_at_position`.
+#: Held for the duration of every capture + PaddleOCR inference. Concurrent
+#: PaddleOCR calls have not shown the crash-on-overlap behaviour manga-ocr's
+#: torch-MPS backend had, but the lock is kept anyway: it's cheap (inference
+#: is ~300 ms) and only one OCR pass is ever useful per hover — the cursor has
+#: usually moved on by the time a second concurrent call would finish.
 _infer_lock = threading.Lock()
 
 
 def _get_model():
-    """Return a cached ``MangaOcr`` instance, loading it on first call.
+    """Return a cached ``PaddleOCR`` instance, loading it on first call.
 
     Thread-safe: the startup warmup thread and a racing first request would
-    otherwise both build a ``MangaOcr`` (each a ~5 s, ~440 MB load). The lock
-    lets the first caller do the load while the rest wait for it.
+    otherwise both build a ``PaddleOCR`` instance (each a multi-second load,
+    longer still on the very first run while weights download). The lock lets
+    the first caller do the load while the rest wait for it.
 
     Returns:
-        The ``manga_ocr.MangaOcr`` callable, or ``None`` if manga-ocr is not
+        The ``paddleocr.PaddleOCR`` instance, or ``None`` if paddleocr is not
         installed or the model could not be loaded (logged once).
     """
-    global _mocr, _mocr_failed
-    if _mocr is not None:
-        return _mocr
-    if _mocr_failed:
+    global _ocr_instance, _ocr_load_failed
+    if _ocr_instance is not None:
+        return _ocr_instance
+    if _ocr_load_failed:
         return None
-    with _mocr_lock:
-        if _mocr is not None:
-            return _mocr
-        if _mocr_failed:
+    with _model_lock:
+        if _ocr_instance is not None:
+            return _ocr_instance
+        if _ocr_load_failed:
             return None
         try:
-            from manga_ocr import MangaOcr
+            from paddleocr import PaddleOCR
         except Exception as exc:  # pragma: no cover - dependency missing
-            print(f"[mirume] manga-ocr not available ({exc}); OCR fallback disabled.")
-            _mocr_failed = True
+            print(f"[mirume] paddleocr not available ({exc}); OCR fallback disabled.")
+            _ocr_load_failed = True
             return None
         try:
             print(
-                "[mirume] loading manga-ocr model (first use, ~2-3s)...",
+                "[mirume] loading PaddleOCR model (first use, several seconds; "
+                "longer on first run while weights download)...",
                 file=sys.stderr,
             )
-            _mocr = MangaOcr()
+            _ocr_instance = PaddleOCR(
+                lang="japan",
+                use_textline_orientation=False,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+            )
         except Exception as exc:  # pragma: no cover - runtime/model failure
-            print(f"[mirume] failed to load manga-ocr model ({exc}); OCR disabled.")
-            _mocr_failed = True
+            print(f"[mirume] failed to load PaddleOCR model ({exc}); OCR disabled.")
+            _ocr_load_failed = True
             return None
-    return _mocr
+    return _ocr_instance
 
 
 # --------------------------------------------------------------------------- #
@@ -380,8 +393,8 @@ def get_chrome_url() -> str:
 def _has_text_contrast(image: "Image.Image") -> bool:
     """Return whether ``image`` has enough tonal range to contain rendered text.
 
-    A near-uniform region (blank background, empty margin) makes manga-ocr
-    hallucinate; we'd rather return nothing there.
+    A near-uniform region (blank background, empty margin) is never worth
+    running the full detect+recognise pipeline over.
     """
     histogram = image.convert("L").histogram()
     total = sum(histogram)
@@ -400,33 +413,33 @@ def _has_text_contrast(image: "Image.Image") -> bool:
 
 
 def extract_text_at_position(x: float, y: float) -> str | None:
-    """OCR a 400x100 region centred on ``(x, y)`` and return any Japanese text.
+    """OCR a 400x200 region centred on ``(x, y)`` and return the line nearest the cursor.
+
+    PaddleOCR's detector finds every line of text in the captured region as a
+    separate bounding box; of those, only the one whose box centre is closest
+    to the cursor (the exact centre of the capture) is returned. This is what
+    keeps a dense page — several unrelated lines of text within 200px of the
+    cursor — from blending into one hallucinated string the way manga-ocr's
+    single whole-region pass did.
 
     Args:
         x: Horizontal screen coordinate (top-left origin, points).
         y: Vertical screen coordinate.
 
     Returns:
-        The recognised text, stripped, or ``None`` when nothing was captured,
-        the model is unavailable or busy, the frontmost app is a blocked dev
-        tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is a blocked AI
-        chat site (:data:`_BLOCKED_DOMAINS`), the region is too low-contrast
-        to hold text, the result is shorter than 2 characters, or fewer than
-        :data:`_MIN_JAPANESE_DENSITY` of the result's characters are Japanese
-        (hiragana / katakana / kanji). manga-ocr always emits *something* — a
-        low-contrast capture or a result that's mostly non-Japanese noise is
-        treated as "no text here".
+        The recognised text of the closest line, stripped, or ``None`` when
+        nothing was captured, the model is unavailable or busy, the frontmost
+        app is a blocked dev tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active
+        tab is a blocked AI chat site (:data:`_BLOCKED_DOMAINS`), the region
+        is too low-contrast to hold text, or no detected line clears both
+        :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese
+        character.
 
-    Concurrency: manga-ocr / torch-MPS inference is **not** reentrant — two
-    overlapping calls crash the whole worker process (silently, with no
-    traceback), which is what leaves ``/hover`` hanging for every later caller.
-    ``FastAPI`` dispatches ``/hover`` across a thread pool and the cursor poller
-    fires every 200 ms, so overlap is the norm. This function therefore takes a
-    process-wide lock for the capture + inference; if it can't get the lock
-    quickly it returns ``None`` (skip OCR for this hover) rather than queue —
-    the cursor has usually moved on anyway. The one-time model load happens
-    before the lock, is slow (~5 s) but bounded, and runs once (normally on the
-    startup warmup thread).
+    Concurrency: a process-wide lock serialises capture + inference — see
+    :data:`_infer_lock`. If it can't be acquired quickly this returns ``None``
+    (skip OCR for this hover) rather than queue — the cursor has usually moved
+    on anyway. The one-time model load happens before the lock, is slow but
+    bounded, and runs once (normally on the startup warmup thread).
     """
     model = _get_model()
     if model is None:
@@ -458,17 +471,45 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         if image is None or not _has_text_contrast(image):
             return None
         try:
-            text = model(image)
+            results = model.predict(np.array(image))
         except Exception:
             return None
     finally:
         _infer_lock.release()
 
-    text = (text or "").strip()
-    if len(text) < 2:
+    if not results:
         return None
-    japanese_chars = len(_JAPANESE_RE.findall(text))
-    if japanese_chars / len(text) < _MIN_JAPANESE_DENSITY:
+    result = results[0]
+    texts = result.get("rec_texts") or []
+    scores = result.get("rec_scores") or []
+    boxes = result.get("rec_boxes")
+    if boxes is None or len(texts) == 0:
+        return None
+
+    # The capture region is centred on the cursor, so the cursor sits at the
+    # exact centre of the image regardless of x/y — the closest detected line
+    # to that point is the one the user is actually pointing at.
+    cursor_in_image = (_OCR_REGION_WIDTH / 2, _OCR_REGION_HEIGHT / 2)
+    best_text: str | None = None
+    best_distance = float("inf")
+    for text, score, box in zip(texts, scores, boxes):
+        if score < _MIN_OCR_CONFIDENCE:
+            continue
+        if not _JAPANESE_RE.search(text):
+            continue
+        box_x1, box_y1, box_x2, box_y2 = (float(v) for v in box[:4])
+        box_center = ((box_x1 + box_x2) / 2, (box_y1 + box_y2) / 2)
+        distance = (
+            (box_center[0] - cursor_in_image[0]) ** 2 + (box_center[1] - cursor_in_image[1]) ** 2
+        ) ** 0.5
+        if distance < best_distance:
+            best_distance = distance
+            best_text = text
+
+    if best_text is None:
+        return None
+    text = best_text.strip()
+    if len(text) < 2:
         return None
     return text
 

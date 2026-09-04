@@ -15,4 +15,5 @@ fasttext==0.9.3
 numpy<2  # fasttext 0.9.3's predict() breaks under NumPy 2.x's stricter copy=False
 deepl==1.32.0
 python-dotenv==1.2.3
-manga-ocr==0.1.16  # screenshot OCR fallback for Chrome/sandboxed web content (pulls torch + transformers)
+paddlepaddle==3.3.1  # CPU inference runtime for paddleocr
+paddleocr==3.7.0  # screenshot OCR fallback for Chrome/sandboxed web content — detection+recognition pipeline, replaced manga-ocr because it blended multiple nearby page elements into one hallucinated read on dense pages
