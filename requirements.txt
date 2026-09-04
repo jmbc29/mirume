@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+watchfiles  # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree and can wedge the worker
 pyobjc-framework-Cocoa
 pyobjc-framework-ApplicationServices
 fugashi

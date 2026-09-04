@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 
 # manga-ocr / huggingface_hub default to the Xet transfer protocol, which has
 # been seen to stall indefinitely on the first weights download behind some
@@ -52,6 +53,14 @@ except Exception as exc:  # pragma: no cover - dependency missing
     ImageGrab = None  # type: ignore[assignment]
     _PIL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
+# NOTE: the CoreGraphics in-process capture APIs (``CGDisplayCreateImage`` /
+# ``CGDisplayCreateImageForRect``) are *not* used here. They are deprecated as
+# of macOS 14 and on macOS 15+ they block for ~5 s on a TCC round-trip and then
+# return ``None`` when called from a non-GUI process like the uvicorn worker,
+# even with Screen Recording granted — worse than the ``screencapture`` CLI,
+# which is a separate signed Apple binary and keeps working. A ScreenCaptureKit
+# path would be the modern replacement but needs an async delegate + run loop.
+
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -60,6 +69,18 @@ except Exception as exc:  # pragma: no cover - dependency missing
 #: Region OCR'd by :func:`extract_text_at_position`, centred on the cursor.
 _OCR_REGION_WIDTH = 400
 _OCR_REGION_HEIGHT = 100
+
+#: Hard ceiling on the ``screencapture`` CLI. It normally returns in well under
+#: 200 ms; anything longer means it is wedged (a permission prompt, a stuck
+#: WindowServer round-trip inside the uvicorn worker) and we abandon it.
+_SCREENCAPTURE_TIMEOUT_S = 2.0
+
+#: How long :func:`extract_text_at_position` waits for the shared inference
+#: slot before giving up on this hover. Capture (~200 ms, or the 2 s
+#: ``screencapture`` timeout) plus inference (~0.5 s) is the normal hold time,
+#: so a wait longer than this means calls are stacking up faster than manga-ocr
+#: can drain them and it is better to skip.
+_OCR_LOCK_WAIT_S = 2.5
 
 #: Codepoint range that counts as "Japanese" — U+3040..U+9FFF spans hiragana,
 #: katakana, the CJK symbols/punctuation block and the CJK unified ideographs
@@ -85,10 +106,20 @@ _MIN_CONTRAST_RANGE = 40
 
 _mocr = None  # cached manga_ocr.MangaOcr instance
 _mocr_failed = False
+_mocr_lock = threading.Lock()  # serialise the one-time load across threads
+
+#: Held for the duration of every capture + manga-ocr inference. torch-MPS
+#: inference is not reentrant — concurrent calls abort the worker process — so
+#: OCR is strictly serialised process-wide. See :func:`extract_text_at_position`.
+_infer_lock = threading.Lock()
 
 
 def _get_model():
     """Return a cached ``MangaOcr`` instance, loading it on first call.
+
+    Thread-safe: the startup warmup thread and a racing first request would
+    otherwise both build a ``MangaOcr`` (each a ~5 s, ~440 MB load). The lock
+    lets the first caller do the load while the rest wait for it.
 
     Returns:
         The ``manga_ocr.MangaOcr`` callable, or ``None`` if manga-ocr is not
@@ -99,19 +130,27 @@ def _get_model():
         return _mocr
     if _mocr_failed:
         return None
-    try:
-        from manga_ocr import MangaOcr
-    except Exception as exc:  # pragma: no cover - dependency missing
-        print(f"[mirume] manga-ocr not available ({exc}); OCR fallback disabled.")
-        _mocr_failed = True
-        return None
-    try:
-        print("[mirume] loading manga-ocr model (first use, ~2-3s)...", file=sys.stderr)
-        _mocr = MangaOcr()
-    except Exception as exc:  # pragma: no cover - runtime/model failure
-        print(f"[mirume] failed to load manga-ocr model ({exc}); OCR disabled.")
-        _mocr_failed = True
-        return None
+    with _mocr_lock:
+        if _mocr is not None:
+            return _mocr
+        if _mocr_failed:
+            return None
+        try:
+            from manga_ocr import MangaOcr
+        except Exception as exc:  # pragma: no cover - dependency missing
+            print(f"[mirume] manga-ocr not available ({exc}); OCR fallback disabled.")
+            _mocr_failed = True
+            return None
+        try:
+            print(
+                "[mirume] loading manga-ocr model (first use, ~2-3s)...",
+                file=sys.stderr,
+            )
+            _mocr = MangaOcr()
+        except Exception as exc:  # pragma: no cover - runtime/model failure
+            print(f"[mirume] failed to load manga-ocr model ({exc}); OCR disabled.")
+            _mocr_failed = True
+            return None
     return _mocr
 
 
@@ -123,9 +162,11 @@ def _get_model():
 def _screencapture_region(left: int, top: int, width: int, height: int) -> "Image.Image | None":
     """Run ``screencapture -x -R`` for one rectangle and load the PNG it writes.
 
-    ``screencapture`` captures the composited framebuffer — what is actually on
-    screen — so a transparent window (Mirume's overlay) contributes nothing and
-    the app underneath is what gets grabbed.
+    The primary capture path. ``screencapture`` grabs the composited
+    framebuffer — what is actually on screen — so a transparent window (Mirume's
+    overlay) contributes nothing and the app underneath is what gets grabbed.
+    Bounded by :data:`_SCREENCAPTURE_TIMEOUT_S` so a wedged subprocess is
+    abandoned rather than hanging the request.
     """
     global _capture_warned
     if Image is None:
@@ -136,7 +177,10 @@ def _screencapture_region(left: int, top: int, width: int, height: int) -> "Imag
         proc = subprocess.run(
             ["screencapture", "-x", "-R", f"{left},{top},{width},{height}", tmp_path],
             capture_output=True,
-            timeout=5,
+            timeout=_SCREENCAPTURE_TIMEOUT_S,
+            # Inherit the launching shell's full environment; a stripped-down
+            # PATH/CFFIXED_USER_HOME has been seen to make the CLI stall.
+            env=os.environ.copy(),
         )
         if proc.returncode != 0:
             if not _capture_warned:
@@ -153,6 +197,15 @@ def _screencapture_region(left: int, top: int, width: int, height: int) -> "Imag
         with Image.open(tmp_path) as image:
             image.load()
             return image.copy()
+    except subprocess.TimeoutExpired:
+        if not _capture_warned:
+            _capture_warned = True
+            print(
+                f"[mirume] screencapture did not return within "
+                f"{_SCREENCAPTURE_TIMEOUT_S:g}s — abandoning it; this hover yields "
+                "no OCR text."
+            )
+        return None
     except (subprocess.SubprocessError, OSError, ValueError):
         return None
     finally:
@@ -166,9 +219,10 @@ def capture_region(x: float, y: float, width: int = 300, height: int = 80) -> "I
     """Screenshot a ``width`` x ``height`` rectangle whose top-left is ``(x, y)``.
 
     Coordinates are top-left-origin screen points (the same convention as the
-    Accessibility API and the cursor poller). Uses the ``screencapture`` CLI —
-    which grabs the composited display, seeing past Mirume's transparent
-    overlay — and falls back to :func:`PIL.ImageGrab.grab`.
+    Accessibility API and the cursor poller). Uses the ``screencapture`` CLI
+    (:func:`_screencapture_region`), falling back to :func:`PIL.ImageGrab.grab`.
+    Both grab the composited display, so Mirume's transparent overlay is
+    invisible to them.
 
     Args:
         x: Left edge of the region, in screen points.
@@ -237,25 +291,40 @@ def extract_text_at_position(x: float, y: float) -> str | None:
 
     Returns:
         The recognised text, stripped, or ``None`` when nothing was captured,
-        the model is unavailable, the region is too low-contrast to hold text,
-        or the result contains no Japanese characters (hiragana / katakana /
-        kanji). manga-ocr always emits *something* — a Japanese-free or
-        low-contrast result is treated as "no text here".
+        the model is unavailable or busy, the region is too low-contrast to
+        hold text, or the result contains no Japanese characters (hiragana /
+        katakana / kanji). manga-ocr always emits *something* — a Japanese-free
+        or low-contrast result is treated as "no text here".
+
+    Concurrency: manga-ocr / torch-MPS inference is **not** reentrant — two
+    overlapping calls crash the whole worker process (silently, with no
+    traceback), which is what leaves ``/hover`` hanging for every later caller.
+    ``FastAPI`` dispatches ``/hover`` across a thread pool and the cursor poller
+    fires every 200 ms, so overlap is the norm. This function therefore takes a
+    process-wide lock for the capture + inference; if it can't get the lock
+    quickly it returns ``None`` (skip OCR for this hover) rather than queue —
+    the cursor has usually moved on anyway. The one-time model load happens
+    before the lock, is slow (~5 s) but bounded, and runs once (normally on the
+    startup warmup thread).
     """
     model = _get_model()
     if model is None:
         return None
 
-    left = x - _OCR_REGION_WIDTH / 2
-    top = y - _OCR_REGION_HEIGHT / 2
-    image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
-    if image is None or not _has_text_contrast(image):
+    if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
         return None
-
     try:
-        text = model(image)
-    except Exception:
-        return None
+        left = x - _OCR_REGION_WIDTH / 2
+        top = y - _OCR_REGION_HEIGHT / 2
+        image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
+        if image is None or not _has_text_contrast(image):
+            return None
+        try:
+            text = model(image)
+        except Exception:
+            return None
+    finally:
+        _infer_lock.release()
 
     text = (text or "").strip()
     if not text or not _JAPANESE_RE.search(text):

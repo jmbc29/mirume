@@ -1,5 +1,6 @@
 fastapi==0.141.1
 uvicorn==0.52.4
+watchfiles==1.2.0  # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree, pinning a CPU core and wedging the worker on a stray restart
 pydantic==2.13.5
 SQLAlchemy==2.0.52
 requests==2.34.2

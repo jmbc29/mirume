@@ -2,10 +2,17 @@
 
 Run locally with::
 
-    uvicorn main:app --reload --port 8123
+    uvicorn main:app --reload --reload-exclude 'venv/*' --port 8123
 
 This starts a server on ``http://127.0.0.1:8123`` (port 8123 to avoid a
-conflict with another local project on 8000). Routes:
+conflict with another local project on 8000). Install ``watchfiles`` (in
+``requirements.txt``) so ``--reload`` uses the event-based watcher;
+``--reload-exclude 'venv/*'`` then keeps it off the 30k-file virtualenv.
+Without both, uvicorn's fallback stat-poll reloader pins a CPU core walking
+``venv/`` every 250 ms and bounces the worker on any stray mtime change. Note
+that the reloader does **not** resurrect a worker that *crashes* (as opposed to
+being restarted) — if ``/hover`` ever hangs for every caller, the worker has
+died and the server must be stopped and restarted. Routes:
 
 * ``GET  /health`` – liveness check; also reports the database paths and
   whether the JMdict dictionary has been built yet.
@@ -35,6 +42,7 @@ Before first use:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import threading
@@ -504,7 +512,26 @@ def health() -> HealthResponse:
 
 
 @app.post("/hover", response_model=HoverResponse)
-def hover(request: HoverRequest) -> HoverResponse:
+async def hover(request: HoverRequest) -> HoverResponse:
+    """Detect and explain the text under the cursor (async wrapper).
+
+    The real work is :func:`_hover_sync`, which blocks: it may take a
+    screenshot and run manga-ocr over it, and it makes synchronous SQLite
+    dictionary lookups. Offloading it to the default executor keeps the event
+    loop free and isolates it from FastAPI's shared sync-endpoint thread pool,
+    so a burst of slow hovers can't starve the other routes.
+
+    Args:
+        request: The screen coordinates the user is hovering over.
+
+    Returns:
+        A :class:`HoverResponse`.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _hover_sync, request)
+
+
+def _hover_sync(request: HoverRequest) -> HoverResponse:
     """Detect the text under the cursor and explain it, in whichever direction fits.
 
     Reads real on-screen text at ``(x, y)`` via the macOS Accessibility API,

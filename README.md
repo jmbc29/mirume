@@ -32,7 +32,9 @@ pip install -r ../requirements.txt
 python jlpt.py build
 
 # Port 8123 avoids a conflict with another local project on 8000.
-uvicorn main:app --reload --port 8123
+# --reload-exclude keeps the reloader off the 30k-file venv/ (otherwise it
+# pins a CPU core and a stray restart mid-request wedges /hover).
+uvicorn main:app --reload --reload-exclude 'venv/*' --port 8123
 ```
 
 **Accessibility permission (macOS):** `/hover` reads on-screen text via the
