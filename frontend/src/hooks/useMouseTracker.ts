@@ -70,10 +70,16 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
         if (!response.ok) {
           throw new Error(`hover request failed: ${response.status}`);
         }
-        const data: HoverResponse = await response.json();
-        if (requestId === requestIdRef.current) {
-          setState({ data, loading: false, error: null });
+        const json: HoverResponse = await response.json();
+        if (requestId !== requestIdRef.current) {
+          return;
         }
+        if (json.source === "placeholder") {
+          // Backend found no real screen text — keep the card hidden.
+          setState((prev) => ({ ...prev, data: null, loading: false, error: null }));
+          return;
+        }
+        setState({ data: json, loading: false, error: null });
       } catch (err) {
         if (requestId === requestIdRef.current) {
           const message = err instanceof Error ? err.message : String(err);

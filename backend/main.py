@@ -514,10 +514,20 @@ def hover(request: HoverRequest) -> HoverResponse:
         describes what was found there (``"ja"``, ``"en"`` or ``"mixed"``).
     """
     detected = get_text_at_position(request.x, request.y) or get_focused_text()
-    if detected:
-        text, source = detected, "accessibility"
-    else:
-        text, source = _PLACEHOLDER_TEXT, "placeholder"
+    if not detected:
+        # Nothing under the cursor (or no Accessibility permission). Return an
+        # empty response rather than the placeholder sentence, so the frontend
+        # keeps the hover card hidden instead of showing it over everything.
+        return HoverResponse(
+            text="",
+            source="placeholder",
+            language="unknown",
+            request_point=request,
+            tokens=[],
+            kanji=[],
+            translations=[],
+        )
+    text, source = detected, "accessibility"
 
     segments = _segment_by_script(text)
     scripts_present = {kind for kind, segment in segments}
