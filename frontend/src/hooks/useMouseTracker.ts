@@ -4,12 +4,12 @@ import type { HoverResponse } from "../types/hover";
 
 const HOVER_ENDPOINT = "http://127.0.0.1:8123/hover";
 /** How often the real cursor position is sampled from the Rust side. */
-const POLL_MS = 500;
+const POLL_MS = 300;
 /** Minimum distance between samples to count as the cursor having moved. */
 const MIN_MOVE_PX = 20;
 /** The cursor must sit still (no sample further than MIN_MOVE_PX away) this
  *  long before a /hover request is fired for it. */
-const STILL_DURATION_MS = 600;
+const STILL_MS = 600;
 /**
  * Once the cursor drifts more than this far from the point that triggered the
  * last hover request, the card is stale — drop the data immediately so it
@@ -33,18 +33,20 @@ export interface CursorPosition {
  * Tracks the cursor and calls the Mirume backend's /hover endpoint once it
  * settles somewhere new.
  *
- * The overlay window is click-through (`set_ignore_cursor_events(true)`), so the
- * webview never receives `mousemove` events while the cursor is over another
- * app. Instead we sample the `get_cursor_position` Rust command every
- * {@link POLL_MS}ms for the real global cursor position (top-left-origin logical
- * screen points).
+ * The overlay window is click-through (`set_ignore_cursor_events(true)`), so
+ * the webview never receives `mousemove` events while the cursor is over
+ * another app — there is no browser event to hook here. Cursor position is
+ * instead sampled from the `get_cursor_position` Rust command on a plain
+ * `setInterval` every {@link POLL_MS}ms; that Rust-side poll is the only
+ * source of position data this hook has.
  *
- * Firing /hover is debounced, not polled: each sample that differs from the
- * previous one by more than {@link MIN_MOVE_PX} resets a
- * {@link STILL_DURATION_MS}ms timer, and only when that timer completes
- * uninterrupted — meaning the cursor has genuinely stopped somewhere — does a
- * /hover request go out. A cursor sweeping across the screen never triggers a
- * request; only a deliberate pause over one spot does.
+ * Firing /hover is debounced on top of that poll, not driven by it directly:
+ * each sample that differs from the last *significant* one by more than
+ * {@link MIN_MOVE_PX} resets a {@link STILL_MS}ms timer, and only when that
+ * timer completes uninterrupted — meaning the cursor has genuinely stopped
+ * somewhere — does a /hover request go out. A cursor sweeping across the
+ * screen keeps resetting the timer and never triggers a request; only a
+ * deliberate pause over one spot does.
  */
 export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition } {
   const [state, setState] = useState<MouseTrackerState>({
@@ -54,8 +56,8 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
   });
   const [cursor, setCursor] = useState<CursorPosition>({ x: 0, y: 0 });
 
-  const lastSampleRef = useRef<CursorPosition | null>(null);
   const lastCalledRef = useRef<CursorPosition | null>(null);
+  const lastSampleRef = useRef<CursorPosition | null>(null);
   const stillTimerRef = useRef<number | undefined>(undefined);
   const requestIdRef = useRef(0);
 
@@ -77,12 +79,12 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
           throw new Error(`hover request failed: ${response.status}`);
         }
         const json: HoverResponse = await response.json();
-        if (requestId !== requestIdRef.current) {
+        if (requestId !== requestIdRef.current || cancelled) {
           return;
         }
         if (json.source === "placeholder") {
           // Backend found no real screen text — keep the card hidden.
-          setState((prev) => ({ ...prev, data: null, loading: false, error: null }));
+          setState({ data: null, loading: false, error: null });
           return;
         }
         setState({ data: json, loading: false, error: null });
@@ -94,46 +96,57 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
       }
     };
 
-    const poll = async () => {
-      let position: CursorPosition;
-      try {
-        const [x, y] = await invoke<[number, number]>("get_cursor_position");
-        position = { x, y };
-      } catch {
-        // Not running inside Tauri (e.g. plain browser dev) — nothing to poll.
-        return;
-      }
-      if (cancelled) return;
-      setCursor(position);
+    // Poll cursor position every POLL_MS via the Rust side — a browser
+    // mousemove listener would never fire on this click-through overlay.
+    const intervalId = window.setInterval(() => {
+      void (async () => {
+        if (cancelled) return;
 
-      const lastSample = lastSampleRef.current;
-      const moved =
-        !lastSample || Math.hypot(position.x - lastSample.x, position.y - lastSample.y) > MIN_MOVE_PX;
-      if (!moved) {
-        // Cursor is holding steady — leave any in-flight still-timer running
-        // rather than restarting it on every sample.
-        return;
-      }
-      lastSampleRef.current = position;
-
-      // The cursor is actively moving again, so a previously shown card no
-      // longer matches where it's pointing. Hide it once the drift from the
-      // point that triggered it is large enough to be a different target.
-      const lastCalled = lastCalledRef.current;
-      if (lastCalled) {
-        const drift = Math.hypot(position.x - lastCalled.x, position.y - lastCalled.y);
-        if (drift > MAX_DRIFT_PX) {
-          setState((prev) => (prev.data ? { ...prev, data: null } : prev));
+        let position: CursorPosition;
+        try {
+          const [x, y] = await invoke<[number, number]>("get_cursor_position");
+          position = { x, y };
+        } catch {
+          // Not running inside Tauri (e.g. plain browser dev) — nothing to poll.
+          return;
         }
-      }
+        if (cancelled) return;
+        setCursor(position);
 
-      window.clearTimeout(stillTimerRef.current);
-      stillTimerRef.current = window.setTimeout(() => {
-        void fireHover(position);
-      }, STILL_DURATION_MS);
-    };
+        const lastSample = lastSampleRef.current;
+        const moved =
+          !lastSample ||
+          Math.hypot(position.x - lastSample.x, position.y - lastSample.y) > MIN_MOVE_PX;
+        if (!moved) {
+          // Cursor is holding steady — leave any in-flight still-timer
+          // running rather than restarting it on every sample.
+          return;
+        }
+        lastSampleRef.current = position;
 
-    const intervalId = window.setInterval(() => void poll(), POLL_MS);
+        // The cursor is actively moving again, so a previously shown card no
+        // longer matches where it's pointing. Hide it once the drift from
+        // the point that triggered it is large enough to be a different
+        // target, and clear the trigger point so drift isn't measured
+        // against stale data.
+        const lastCalled = lastCalledRef.current;
+        if (lastCalled) {
+          const drift = Math.hypot(position.x - lastCalled.x, position.y - lastCalled.y);
+          if (drift > MAX_DRIFT_PX) {
+            lastCalledRef.current = null;
+            setState((prev) => (prev.data ? { ...prev, data: null } : prev));
+          }
+        }
+
+        window.clearTimeout(stillTimerRef.current);
+        stillTimerRef.current = window.setTimeout(() => {
+          if (!cancelled) {
+            void fireHover(position);
+          }
+        }, STILL_MS);
+      })();
+    }, POLL_MS);
+
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
