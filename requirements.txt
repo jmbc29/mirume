@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
+fugashi
+unidic-lite
+sqlalchemy
+pydantic
+requests

@@ -216,3 +216,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --------------------------------------------------------------------------- #
+# Mirume
+# --------------------------------------------------------------------------- #
+
+# Generated SQLite databases and downloaded dictionary sources (large, regenerable)
+data/*
+!data/.gitkeep
+
+# Saved PyTorch model files
+models/*
+!models/.gitkeep
+
+# Backend virtual environment
+backend/venv/
