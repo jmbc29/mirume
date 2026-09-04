@@ -11,31 +11,47 @@ conflict with another local project on 8000). Routes:
   whether the JMdict dictionary has been built yet.
 * ``POST /hover``   – accepts ``{x, y}`` screen coordinates. Reads the real
   on-screen text at that point via the macOS Accessibility API
-  (:mod:`accessibility`), then runs it through the tokeniser and JLPT
-  classifier. Falls back to a fixed placeholder sentence when no text is
-  found (``source`` is ``"accessibility"`` vs ``"placeholder"``).
+  (:mod:`accessibility`), detects whether it's Japanese, English, or a mix
+  (:mod:`language`), then routes it through the JLPT classifier
+  (:mod:`jlpt`) and/or the DeepL translator (:mod:`translator`) as needed.
+  Falls back to a fixed placeholder sentence when no text is found
+  (``source`` is ``"accessibility"`` vs ``"placeholder"``).
+* ``POST /save/word`` / ``/save/sentence`` / ``/save/grammar`` – save items
+  the user wants to remember, to ``mirume.db`` (:mod:`models`).
+* ``POST /encounter`` – log a passive hover exposure for progress stats.
+* ``GET  /review`` / ``POST /review/grade`` – SM-2 spaced-repetition review
+  queue (:mod:`spaced_rep`).
+* ``GET  /stats`` – aggregate progress statistics.
 
 Before first use:
 
 * Build the dictionary once::   python jlpt.py build
 * Grant Accessibility permission to the terminal / Python (see
   :mod:`accessibility`); without it every hover falls back to the placeholder.
+* Add a DeepL API key to ``backend/.env`` (``DEEPL_API_KEY=...``) to enable
+  English→Japanese translation; without it, English hover text is detected
+  but not translated.
 """
 
 from __future__ import annotations
 
+import os
+import re
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from typing import AsyncIterator
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from accessibility import (
     accessibility_permission_granted,
     get_focused_text,
     get_text_at_position,
 )
-from database import JMDICT_DB_PATH, MIRUME_DB_PATH, init_databases
+from database import JMDICT_DB_PATH, MIRUME_DB_PATH, get_mirume_session, init_databases
 from jlpt import (
     ClassifiedToken,
     KanjiInfo,
@@ -43,9 +59,13 @@ from jlpt import (
     dictionary_ready,
     get_kanji_breakdown,
 )
+from language import detect_language
+from models import JLPT_LEVELS, SavedGrammar, SavedSentence, SavedWord, WordEncounter
+from spaced_rep import sm2
 from tokeniser import tokenise
+from translator import TranslatorNotConfiguredError, english_to_japanese
 
-API_VERSION = "0.3.0"
+API_VERSION = "0.4.0"
 
 #: Placeholder Japanese sentence returned by the /hover stub — "Studying
 #: Japanese is hard, but it's fun." Chosen to span several JLPT levels so the
@@ -81,6 +101,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "always fall back to the placeholder sentence.\n"
             "[mirume] Grant it in System Settings > Privacy & Security > "
             "Accessibility for your terminal (or Python), then restart.\n"
+        )
+    if not os.environ.get("DEEPL_API_KEY", "").strip():
+        print(
+            "\n[mirume] DEEPL_API_KEY is not set — /hover will detect English text "
+            "but skip translation.\n"
+            "[mirume] Add it to backend/.env (get a free-tier key at "
+            "https://www.deepl.com/pro-api).\n"
         )
     yield
 
@@ -200,20 +227,227 @@ class KanjiOut(BaseModel):
         )
 
 
+class TranslationOut(BaseModel):
+    """An English→Japanese translation of one segment of the detected text."""
+
+    source_text: str = Field(description="The original English segment that was translated.")
+    translation: str = Field(description="Japanese translation.")
+    reading: str | None = Field(description="Hiragana reading of the translation.")
+    jlpt_level: str = Field(description="Hardest JLPT level in the translation, or 'unknown'.")
+    jlpt_name: str = Field(description="Same as jlpt_level; kept for API symmetry.")
+    grammar_patterns: list[dict[str, str]] = Field(
+        description="Common JLPT grammar patterns detected in the translation."
+    )
+    alternatives: list[str] = Field(
+        description="Alternative phrasings, roughly casual (N5) to formal (N2)."
+    )
+
+    @classmethod
+    def from_result(cls, source_text: str, result: dict) -> "TranslationOut":
+        """Build a :class:`TranslationOut` from :func:`translator.english_to_japanese`.
+
+        Args:
+            source_text: The English segment that was translated.
+            result: The dict returned by :func:`translator.english_to_japanese`.
+
+        Returns:
+            The corresponding response model.
+        """
+        return cls(source_text=source_text, **result)
+
+
 class HoverResponse(BaseModel):
     """Body returned by ``POST /hover``."""
 
-    text: str = Field(description="Detected Japanese text under the cursor.")
+    text: str = Field(description="Detected text under the cursor.")
     source: str = Field(
         description="How the text was obtained: 'accessibility' (real screen "
         "text), 'placeholder' (fallback — nothing detected or no permission), "
         "or 'ocr' (not implemented yet)."
     )
+    language: str = Field(
+        description="Detected language of the text: 'ja', 'en', or 'mixed'."
+    )
     request_point: HoverRequest = Field(description="Echo of the requested coordinates.")
-    tokens: list[TokenOut] = Field(description="Classified words, in reading order.")
+    tokens: list[TokenOut] = Field(
+        description="Classified Japanese words, in reading order — populated for "
+        "'ja' and 'mixed' text, empty for pure 'en' text."
+    )
     kanji: list[KanjiOut] = Field(
         description="Per-kanji breakdown for every distinct kanji in the text."
     )
+    translations: list[TranslationOut] = Field(
+        description="English→Japanese translations — one entry for pure 'en' text, "
+        "one per English segment for 'mixed' text, empty for pure 'ja' text."
+    )
+
+
+class SaveWordRequest(BaseModel):
+    """Body accepted by ``POST /save/word``."""
+
+    word: str = Field(description="Surface form of the word to save.")
+    reading: str | None = Field(default=None, description="Kana reading for furigana.")
+    meaning: str | None = Field(default=None, description="Short English gloss.")
+    jlpt_level: str = Field(default="unknown", description="One of N5..N1 or 'unknown'.")
+    context_sentence: str | None = Field(
+        default=None, description="Sentence the word was saved from."
+    )
+
+
+class SaveWordResponse(BaseModel):
+    """Body returned by ``POST /save/word``."""
+
+    saved: bool
+    word_id: int
+
+
+class SaveSentenceRequest(BaseModel):
+    """Body accepted by ``POST /save/sentence``."""
+
+    sentence: str = Field(description="The sentence text.")
+    reading: str | None = Field(default=None, description="Furigana reading.")
+    translation: str | None = Field(default=None, description="English translation.")
+    source: str | None = Field(default=None, description="App the sentence was seen in.")
+    jlpt_level: str = Field(
+        default="unknown", description="Dominant JLPT level appearing in the sentence."
+    )
+
+
+class SaveSentenceResponse(BaseModel):
+    """Body returned by ``POST /save/sentence``."""
+
+    saved: bool
+    sentence_id: int
+
+
+class SaveGrammarRequest(BaseModel):
+    """Body accepted by ``POST /save/grammar``."""
+
+    pattern: str = Field(description="Canonical form of the grammar pattern.")
+    name: str | None = Field(default=None, description="Short human-readable name.")
+    explanation: str | None = Field(default=None, description="What the pattern expresses.")
+    example: str | None = Field(default=None, description="An example sentence.")
+    jlpt_level: str = Field(default="unknown", description="One of N5..N1 or 'unknown'.")
+
+
+class SaveGrammarResponse(BaseModel):
+    """Body returned by ``POST /save/grammar``."""
+
+    saved: bool
+    grammar_id: int
+
+
+class EncounterRequest(BaseModel):
+    """Body accepted by ``POST /encounter``."""
+
+    word: str = Field(description="Surface form of the word encountered.")
+    jlpt_level: str = Field(default="unknown", description="One of N5..N1 or 'unknown'.")
+    app_context: str | None = Field(
+        default=None, description="App the word was hovered in."
+    )
+
+
+class EncounterResponse(BaseModel):
+    """Body returned by ``POST /encounter``."""
+
+    logged: bool
+
+
+class SavedWordOut(BaseModel):
+    """A :class:`models.SavedWord` row, serialised for API responses."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    surface: str
+    lemma: str | None
+    reading: str | None
+    meaning: str | None
+    jlpt_level: str
+    context_sentence: str | None
+    times_seen: int
+    ease_factor: float
+    interval_days: int
+    repetitions: int
+    due_date: datetime
+    last_seen: datetime
+    created_at: datetime
+
+
+class ReviewResponse(BaseModel):
+    """Body returned by ``GET /review``."""
+
+    due_count: int
+    words: list[SavedWordOut]
+
+
+class StatsResponse(BaseModel):
+    """Body returned by ``GET /stats``."""
+
+    total_saved_words: int
+    total_saved_sentences: int
+    total_encounters: int
+    words_by_level: dict[str, int]
+    due_for_review: int
+    most_seen_words: list[SavedWordOut]
+
+
+class GradeRequest(BaseModel):
+    """Body accepted by ``POST /review/grade``."""
+
+    word_id: int = Field(description="Id of the SavedWord being reviewed.")
+    grade: int = Field(ge=0, le=5, description="Self-graded recall quality, 0-5.")
+
+
+class GradeResponse(BaseModel):
+    """Body returned by ``POST /review/grade``."""
+
+    next_review: date
+    interval_days: int
+
+
+#: Hiragana, katakana and CJK ideograph ranges — used to split hover text into
+#: same-script runs so mixed Japanese/English text can be routed per-segment.
+_JAPANESE_SCRIPT_RE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
+_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+
+
+def _segment_by_script(text: str) -> list[tuple[str, str]]:
+    """Split ``text`` into contiguous runs of Japanese-script vs Latin-script text.
+
+    Neutral characters (digits, punctuation, whitespace) are attached to
+    whichever run they fall inside rather than starting a new one, so
+    ``"食べた 2 apples"`` stays as two runs, not four.
+
+    Args:
+        text: Arbitrary hover text, possibly mixing Japanese and English.
+
+    Returns:
+        A list of ``(kind, segment)`` pairs, ``kind`` being ``"ja"`` or
+        ``"en"``, in the order the segments appear in ``text``. Segments that
+        are entirely whitespace are dropped.
+    """
+    segments: list[tuple[str, str]] = []
+    buffer = ""
+    kind: str | None = None
+    for char in text:
+        if _JAPANESE_SCRIPT_RE.match(char):
+            char_kind = "ja"
+        elif _LATIN_LETTER_RE.match(char):
+            char_kind = "en"
+        else:
+            char_kind = None
+
+        if char_kind is not None and kind is not None and char_kind != kind:
+            segments.append((kind, buffer))
+            buffer = ""
+        if char_kind is not None:
+            kind = char_kind
+        buffer += char
+
+    if buffer.strip():
+        segments.append((kind or "en", buffer))
+    return [(k, s) for k, s in segments if s.strip()]
 
 
 # --------------------------------------------------------------------------- #
@@ -240,21 +474,31 @@ def health() -> HealthResponse:
 
 @app.post("/hover", response_model=HoverResponse)
 def hover(request: HoverRequest) -> HoverResponse:
-    """Detect the text under the cursor and classify it by JLPT level.
+    """Detect the text under the cursor and explain it, in whichever direction fits.
 
     Reads real on-screen text at ``(x, y)`` via the macOS Accessibility API,
     then the currently-focused element as a fallback. If neither yields text
     (nothing there, or permission not granted) a fixed placeholder sentence is
-    used. The resulting text is tokenised (:func:`tokeniser.tokenise`),
-    classified against JMdict + the JLPT lists (:func:`jlpt.classify_tokens`),
-    and given a per-kanji breakdown (:func:`jlpt.get_kanji_breakdown`).
+    used.
+
+    The text is then routed by script composition (:func:`_segment_by_script`):
+
+    * Pure Japanese → tokenised and classified against JMdict + the JLPT
+      lists (:func:`jlpt.classify_tokens`), same as before.
+    * Pure English → translated to Japanese and classified the same way
+      (:func:`translator.english_to_japanese`), so the response always
+      carries JLPT-graded content.
+    * Mixed text → split into same-script runs, each handled by whichever of
+      the above pipelines fits; Japanese runs contribute to ``tokens``,
+      English runs each become one ``translations`` entry.
 
     Args:
         request: The screen coordinates the user is hovering over.
 
     Returns:
-        A :class:`HoverResponse`. ``source`` is ``"accessibility"`` when real
-        text was read, otherwise ``"placeholder"``.
+        A :class:`HoverResponse`. ``source`` describes how the text was
+        obtained (``"accessibility"`` vs ``"placeholder"``); ``language``
+        describes what was found there (``"ja"``, ``"en"`` or ``"mixed"``).
     """
     detected = get_text_at_position(request.x, request.y) or get_focused_text()
     if detected:
@@ -262,12 +506,270 @@ def hover(request: HoverRequest) -> HoverResponse:
     else:
         text, source = _PLACEHOLDER_TEXT, "placeholder"
 
-    tokens = [TokenOut.from_classified(t) for t in classify_tokens(tokenise(text))]
+    segments = _segment_by_script(text)
+    scripts_present = {kind for kind, segment in segments}
+
+    if scripts_present == {"ja"}:
+        language = "ja"
+    elif scripts_present == {"en"}:
+        language = "en"
+    elif scripts_present == {"ja", "en"}:
+        language = "mixed"
+    else:
+        # No segment survived (empty/whitespace-only text) — fall back to the
+        # general-purpose detector.
+        language = detect_language(text)
+
+    tokens: list[TokenOut] = []
+    translations: list[TranslationOut] = []
+    for kind, segment in segments:
+        if kind == "ja":
+            tokens.extend(
+                TokenOut.from_classified(t) for t in classify_tokens(tokenise(segment))
+            )
+        else:
+            try:
+                result = english_to_japanese(segment)
+            except TranslatorNotConfiguredError:
+                continue
+            translations.append(TranslationOut.from_result(segment, result))
+
     kanji = [KanjiOut.from_kanji_info(k) for k in get_kanji_breakdown(text)]
     return HoverResponse(
         text=text,
         source=source,
+        language=language,
         request_point=request,
         tokens=tokens,
         kanji=kanji,
+        translations=translations,
+    )
+
+
+@app.post("/save/word", response_model=SaveWordResponse)
+def save_word(
+    request: SaveWordRequest, db: Session = Depends(get_mirume_session)
+) -> SaveWordResponse:
+    """Save a vocabulary word, or bump its exposure count if already saved.
+
+    Matches existing saves by exact surface form. A repeat save increments
+    ``times_seen`` and refreshes ``last_seen`` / ``context_sentence`` rather
+    than creating a duplicate row.
+
+    Args:
+        request: The word, reading, meaning, JLPT level and optional context.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`SaveWordResponse` with the row's id.
+    """
+    now = datetime.now(timezone.utc)
+    existing = db.execute(
+        select(SavedWord).where(SavedWord.surface == request.word)
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        existing.times_seen += 1
+        existing.last_seen = now
+        if request.context_sentence:
+            existing.context_sentence = request.context_sentence
+        db.commit()
+        return SaveWordResponse(saved=True, word_id=existing.id)
+
+    word = SavedWord(
+        surface=request.word,
+        reading=request.reading,
+        meaning=request.meaning,
+        jlpt_level=request.jlpt_level,
+        context_sentence=request.context_sentence,
+        times_seen=1,
+        last_seen=now,
+    )
+    db.add(word)
+    db.commit()
+    db.refresh(word)
+    return SaveWordResponse(saved=True, word_id=word.id)
+
+
+@app.post("/save/sentence", response_model=SaveSentenceResponse)
+def save_sentence(
+    request: SaveSentenceRequest, db: Session = Depends(get_mirume_session)
+) -> SaveSentenceResponse:
+    """Save a sentence, usually as context for a saved word.
+
+    Args:
+        request: The sentence text and optional reading/translation/source.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`SaveSentenceResponse` with the new row's id.
+    """
+    sentence = SavedSentence(
+        text=request.sentence,
+        reading=request.reading,
+        translation=request.translation,
+        dominant_jlpt_level=request.jlpt_level,
+        source_app=request.source,
+    )
+    db.add(sentence)
+    db.commit()
+    db.refresh(sentence)
+    return SaveSentenceResponse(saved=True, sentence_id=sentence.id)
+
+
+@app.post("/save/grammar", response_model=SaveGrammarResponse)
+def save_grammar(
+    request: SaveGrammarRequest, db: Session = Depends(get_mirume_session)
+) -> SaveGrammarResponse:
+    """Save a JLPT grammar pattern.
+
+    Args:
+        request: The pattern, its name, explanation, example and JLPT level.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`SaveGrammarResponse` with the new row's id.
+    """
+    grammar = SavedGrammar(
+        pattern=request.pattern,
+        name=request.name,
+        meaning=request.explanation,
+        example_sentence=request.example,
+        jlpt_level=request.jlpt_level,
+    )
+    db.add(grammar)
+    db.commit()
+    db.refresh(grammar)
+    return SaveGrammarResponse(saved=True, grammar_id=grammar.id)
+
+
+@app.post("/encounter", response_model=EncounterResponse)
+def log_encounter(
+    request: EncounterRequest, db: Session = Depends(get_mirume_session)
+) -> EncounterResponse:
+    """Log one passive exposure to a word (called on every hover).
+
+    Independent of whether the word has been saved; if it has, the encounter
+    is linked to the :class:`SavedWord` row via ``saved_word_id``.
+
+    Args:
+        request: The word, its JLPT level and the app it appeared in.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        An :class:`EncounterResponse` acknowledging the log.
+    """
+    saved_word = db.execute(
+        select(SavedWord).where(SavedWord.surface == request.word)
+    ).scalar_one_or_none()
+    encounter = WordEncounter(
+        surface=request.word,
+        jlpt_level=request.jlpt_level,
+        source_app=request.app_context,
+        saved_word_id=saved_word.id if saved_word else None,
+    )
+    db.add(encounter)
+    db.commit()
+    return EncounterResponse(logged=True)
+
+
+@app.get("/review", response_model=ReviewResponse)
+def get_review(db: Session = Depends(get_mirume_session)) -> ReviewResponse:
+    """Return saved words due for review today, per SM-2 scheduling.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`ReviewResponse` with the due words ordered soonest-due first.
+    """
+    now = datetime.now(timezone.utc)
+    due = (
+        db.execute(
+            select(SavedWord).where(SavedWord.due_date <= now).order_by(SavedWord.due_date)
+        )
+        .scalars()
+        .all()
+    )
+    words = [SavedWordOut.model_validate(w) for w in due]
+    return ReviewResponse(due_count=len(words), words=words)
+
+
+@app.get("/stats", response_model=StatsResponse)
+def get_stats(db: Session = Depends(get_mirume_session)) -> StatsResponse:
+    """Return aggregate progress statistics across saved words and encounters.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`StatsResponse` with totals, a per-level breakdown, the
+        current review queue size and the ten most-encountered saved words.
+    """
+    total_words = db.execute(select(func.count()).select_from(SavedWord)).scalar_one()
+    total_sentences = db.execute(
+        select(func.count()).select_from(SavedSentence)
+    ).scalar_one()
+    total_encounters = db.execute(
+        select(func.count()).select_from(WordEncounter)
+    ).scalar_one()
+
+    level_rows = db.execute(
+        select(SavedWord.jlpt_level, func.count()).group_by(SavedWord.jlpt_level)
+    ).all()
+    level_counts = dict(level_rows)
+    words_by_level = {
+        level: level_counts.get(level, 0) for level in JLPT_LEVELS if level != "unknown"
+    }
+
+    now = datetime.now(timezone.utc)
+    due_for_review = db.execute(
+        select(func.count()).select_from(SavedWord).where(SavedWord.due_date <= now)
+    ).scalar_one()
+
+    most_seen = (
+        db.execute(select(SavedWord).order_by(SavedWord.times_seen.desc()).limit(10))
+        .scalars()
+        .all()
+    )
+
+    return StatsResponse(
+        total_saved_words=total_words,
+        total_saved_sentences=total_sentences,
+        total_encounters=total_encounters,
+        words_by_level=words_by_level,
+        due_for_review=due_for_review,
+        most_seen_words=[SavedWordOut.model_validate(w) for w in most_seen],
+    )
+
+
+@app.post("/review/grade", response_model=GradeResponse)
+def grade_review(
+    request: GradeRequest, db: Session = Depends(get_mirume_session)
+) -> GradeResponse:
+    """Grade a review and reschedule the word per SM-2.
+
+    Args:
+        request: The word id and a 0-5 self-graded recall quality.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`GradeResponse` with the new due date and interval.
+
+    Raises:
+        HTTPException: 404 if no :class:`SavedWord` matches ``word_id``.
+    """
+    word = db.get(SavedWord, request.word_id)
+    if word is None:
+        raise HTTPException(status_code=404, detail="word not found")
+
+    result = sm2(word.ease_factor, word.interval_days, word.repetitions, request.grade)
+    word.ease_factor = result.ease_factor
+    word.interval_days = result.interval_days
+    word.repetitions = result.repetitions
+    word.due_date = result.next_review_date
+    db.commit()
+
+    return GradeResponse(
+        next_review=result.next_review_date.date(), interval_days=result.interval_days
     )

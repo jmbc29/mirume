@@ -50,6 +50,10 @@ class SavedWord(Base):
         jlpt_level: One of :data:`JLPT_LEVELS`.
         jmdict_id: JMdict entry id this word was matched to, if any.
         source_app: Name of the app the word was hovered in (e.g. ``"Safari"``).
+        context_sentence: The sentence the word was saved from, if given.
+        times_seen: Number of times the word has been saved/re-saved —
+            incremented by ``POST /save/word`` on a repeat save.
+        last_seen: When the word was last saved or re-encountered via save.
         ease_factor: SM-2 ease factor; starts at 2.5.
         interval_days: SM-2 current inter-review interval in days.
         repetitions: SM-2 count of consecutive successful reviews.
@@ -69,6 +73,11 @@ class SavedWord(Base):
     jlpt_level: Mapped[str] = mapped_column(String(8), default="unknown", index=True)
     jmdict_id: Mapped[int | None] = mapped_column(Integer, default=None, index=True)
     source_app: Mapped[str | None] = mapped_column(String(128), default=None)
+    context_sentence: Mapped[str | None] = mapped_column(Text, default=None)
+    times_seen: Mapped[int] = mapped_column(Integer, default=1)
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now()
+    )
 
     # --- SM-2 spaced-repetition state -------------------------------------- #
     ease_factor: Mapped[float] = mapped_column(Float, default=2.5)
@@ -132,7 +141,8 @@ class SavedGrammar(Base):
     Attributes:
         id: Surrogate primary key.
         pattern: Canonical form of the pattern (e.g. ``"~なければならない"``).
-        meaning: Short explanation of what the pattern expresses.
+        name: Short human-readable name for the pattern.
+        meaning: Explanation of what the pattern expresses.
         jlpt_level: One of :data:`JLPT_LEVELS`.
         example_sentence: The sentence the pattern was detected in.
         notes: Free-form user notes.
@@ -148,6 +158,7 @@ class SavedGrammar(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     pattern: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str | None] = mapped_column(String(128), default=None)
     meaning: Mapped[str | None] = mapped_column(Text, default=None)
     jlpt_level: Mapped[str] = mapped_column(String(8), default="unknown", index=True)
     example_sentence: Mapped[str | None] = mapped_column(Text, default=None)

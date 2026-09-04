@@ -1,0 +1,16 @@
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+SQLAlchemy==2.0.52
+requests==2.34.2
+fugashi==1.5.2
+unidic-lite==1.0.8
+pyobjc-core==12.2.2
+pyobjc-framework-ApplicationServices==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-CoreText==12.2.2
+pyobjc-framework-Quartz==12.2.2
+fasttext==0.9.3
+numpy<2  # fasttext 0.9.3's predict() breaks under NumPy 2.x's stricter copy=False
+deepl==1.32.0
+python-dotenv==1.2.3
