@@ -84,8 +84,9 @@ _OCR_LOCK_WAIT_S = 2.5
 
 #: Codepoint range that counts as "Japanese" — U+3040..U+9FFF spans hiragana,
 #: katakana, the CJK symbols/punctuation block and the CJK unified ideographs
-#: (kanji). If an OCR result contains none of these it is noise (manga-ocr
-#: hallucinates short Latin strings on empty or dark backgrounds) and we drop it.
+#: (kanji). Used both to reject results with none of these (manga-ocr
+#: hallucinates short Latin strings on empty or dark backgrounds) and to check
+#: what fraction of a result is actually Japanese (see _MIN_JAPANESE_DENSITY).
 _JAPANESE_RE = re.compile(r"[぀-鿿]")
 
 #: Set once we've warned that ``screencapture`` is failing (almost always a
@@ -97,7 +98,13 @@ _capture_warned = False
 #: Japanese hallucination. Skip OCR entirely when the captured region has too
 #: little tonal contrast to contain rendered text — measured as the spread
 #: between the 5th and 95th percentile of greyscale pixel values (0-255).
-_MIN_CONTRAST_RANGE = 40
+_MIN_CONTRAST_RANGE = 60
+
+#: Minimum fraction of non-whitespace characters in an OCR result that must be
+#: Japanese for the result to be trusted. manga-ocr sometimes locks onto a
+#: sliver of nearby English/UI text at the edge of the capture region; a
+#: result that's mostly non-Japanese is more likely noise than a real word.
+_MIN_JAPANESE_DENSITY = 0.3
 
 
 # --------------------------------------------------------------------------- #
@@ -292,9 +299,10 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     Returns:
         The recognised text, stripped, or ``None`` when nothing was captured,
         the model is unavailable or busy, the region is too low-contrast to
-        hold text, or the result contains no Japanese characters (hiragana /
-        katakana / kanji). manga-ocr always emits *something* — a Japanese-free
-        or low-contrast result is treated as "no text here".
+        hold text, or fewer than :data:`_MIN_JAPANESE_DENSITY` of the result's
+        characters are Japanese (hiragana / katakana / kanji). manga-ocr
+        always emits *something* — a low-contrast capture or a result that's
+        mostly non-Japanese noise is treated as "no text here".
 
     Concurrency: manga-ocr / torch-MPS inference is **not** reentrant — two
     overlapping calls crash the whole worker process (silently, with no
@@ -327,7 +335,10 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         _infer_lock.release()
 
     text = (text or "").strip()
-    if not text or not _JAPANESE_RE.search(text):
+    if not text:
+        return None
+    japanese_chars = len(_JAPANESE_RE.findall(text))
+    if japanese_chars / len(text) < _MIN_JAPANESE_DENSITY:
         return None
     return text
 

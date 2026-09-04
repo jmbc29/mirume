@@ -36,6 +36,7 @@ from __future__ import annotations
 import csv
 import gzip
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -78,6 +79,11 @@ JLPT_INT_TO_NAME: dict[int, str] = {5: "N5", 4: "N4", 3: "N3", 2: "N2", 1: "N1"}
 #: Rough kanjidic2 (old 4-level) → new 5-level fallback, used only when the
 #: estimated new-JLPT list has no entry for a kanji.
 _OLD_JLPT_TO_NEW: dict[int, int] = {4: 5, 3: 4, 2: 3, 1: 2}
+
+#: Hiragana/katakana/CJK range used to detect whether a token surface contains
+#: any Japanese characters at all — OCR noise (page numbers, stray Latin/ASCII
+#: symbols) tokenises into "words" with no Japanese in them whatsoever.
+_JAPANESE_CHAR_RE = re.compile(r"[぀-鿿]")
 
 #: unidic ``pos1`` values for function words / symbols. These are structural,
 #: not vocabulary to learn, so :func:`classify_tokens` does not attach a
@@ -686,7 +692,9 @@ def classify_tokens(tokens: list[Token]) -> list[ClassifiedToken]:
     """
     def _enrich(token: Token) -> bool:
         """Whether this token should get dictionary / JLPT data attached."""
-        return token.part_of_speech not in _FUNCTION_POS
+        if token.part_of_speech in _FUNCTION_POS:
+            return False
+        return bool(_JAPANESE_CHAR_RE.search(token.surface))
 
     keys: set[str] = set()
     for token in tokens:

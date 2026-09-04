@@ -450,6 +450,29 @@ class GradeResponse(BaseModel):
 _JAPANESE_SCRIPT_RE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 
+#: Narrower Japanese-character check used to drop OCR noise tokens (page
+#: numbers, stray symbols) from /hover's token list — see _is_junk_token.
+_JAPANESE_CHAR_RE = re.compile(r"[぀-鿿]")
+
+
+def _is_junk_token(token: TokenOut) -> bool:
+    """Whether a classified token is OCR noise rather than a real word.
+
+    OCR occasionally reads page furniture (view counts, numbering) as text;
+    the tokeniser happily turns ``"68"`` into a "word" that then gets a
+    (bogus) JLPT classification. Drop anything that's purely numeric or has
+    no Japanese characters in it at all.
+
+    Args:
+        token: A classified token from the /hover response.
+
+    Returns:
+        True if the token should be dropped.
+    """
+    if token.surface.isnumeric():
+        return True
+    return not _JAPANESE_CHAR_RE.search(token.surface)
+
 
 def _segment_by_script(text: str) -> list[tuple[str, str]]:
     """Split ``text`` into contiguous runs of Japanese-script vs Latin-script text.
@@ -597,7 +620,11 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
     for kind, segment in segments:
         if kind == "ja":
             tokens.extend(
-                TokenOut.from_classified(t) for t in classify_tokens(tokenise(segment))
+                t
+                for t in (
+                    TokenOut.from_classified(c) for c in classify_tokens(tokenise(segment))
+                )
+                if not _is_junk_token(t)
             )
         else:
             try:

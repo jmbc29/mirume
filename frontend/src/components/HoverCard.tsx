@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { HoverResponse, KanjiOut, TokenOut, TranslationOut } from "../types/hover";
+import type { HoverResponse, TokenOut, TranslationOut } from "../types/hover";
 import type { CursorPosition } from "../hooks/useMouseTracker";
 
 const SAVE_WORD_ENDPOINT = "http://127.0.0.1:8123/save/word";
 const SAVE_SENTENCE_ENDPOINT = "http://127.0.0.1:8123/save/sentence";
 const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
-const CARD_MAX_WIDTH = 320;
-const ESTIMATED_CARD_HEIGHT = 400;
+const CARD_MAX_WIDTH = 340;
+const CARD_MAX_HEIGHT = 380;
+const MAX_WORDS_SHOWN = 3;
+const MEANING_MAX_CHARS = 50;
 
 const JLPT_COLORS: Record<string, string> = {
   N5: "#22c55e",
@@ -17,6 +19,11 @@ const JLPT_COLORS: Record<string, string> = {
   N2: "#f97316",
   N1: "#ef4444",
 };
+const UNKNOWN_COLOR = "#6b7280";
+
+function truncate(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
 
 function JlptBadge({ name }: { name: string }) {
   const color = JLPT_COLORS[name];
@@ -25,35 +32,17 @@ function JlptBadge({ name }: { name: string }) {
     <span
       style={{
         display: "inline-block",
-        padding: "2px 8px",
+        padding: "1px 6px",
         borderRadius: 6,
-        fontSize: 11,
+        fontSize: 10,
         fontWeight: 600,
         color: "#0a0a0a",
         backgroundColor: color,
+        flexShrink: 0,
       }}
     >
       {name}
     </span>
-  );
-}
-
-function KanjiChip({ kanji }: { kanji: KanjiOut }) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 6,
-        padding: "4px 6px",
-        borderRadius: 6,
-        backgroundColor: "rgba(255,255,255,0.05)",
-      }}
-    >
-      <span style={{ fontSize: 16 }}>{kanji.literal}</span>
-      <JlptBadge name={kanji.jlpt_name} />
-      <span style={{ fontSize: 11, opacity: 0.7 }}>{kanji.meaning}</span>
-    </div>
   );
 }
 
@@ -67,7 +56,6 @@ function SaveButton({ onClick, label }: { onClick: () => void; label: string }) 
       }}
       disabled={saved}
       style={{
-        marginTop: 8,
         padding: "4px 12px",
         borderRadius: 6,
         border: "1px solid rgba(255,255,255,0.15)",
@@ -75,6 +63,7 @@ function SaveButton({ onClick, label }: { onClick: () => void; label: string }) 
         color: "#e2e8f0",
         fontSize: 12,
         cursor: saved ? "default" : "pointer",
+        flexShrink: 0,
       }}
     >
       {saved ? "Saved" : label}
@@ -82,48 +71,57 @@ function SaveButton({ onClick, label }: { onClick: () => void; label: string }) 
   );
 }
 
-function JapaneseWordEntry({ token, kanji }: { token: TokenOut; kanji: KanjiOut[] }) {
-  const relatedKanji = kanji.filter((k) => token.surface.includes(k.literal));
+/** Full detected sentence, each token colour-coded by its JLPT level. */
+function SentenceDisplay({ tokens }: { tokens: TokenOut[] }) {
+  return (
+    <div style={{ fontSize: 16, lineHeight: 1.6 }}>
+      {tokens.map((t, i) => (
+        <span key={i} style={{ color: JLPT_COLORS[t.jlpt_name] ?? UNKNOWN_COLOR }}>
+          {t.surface}
+        </span>
+      ))}
+    </div>
+  );
+}
 
-  const save = () => {
-    void fetch(SAVE_WORD_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        word: token.surface,
-        reading: token.reading,
-        meaning: token.meaning,
-        jlpt_level: token.jlpt_name,
-      }),
-    });
-  };
-
+/** One compact row in the top-3 rarest-words list. */
+function WordRow({ token, showBorder }: { token: TokenOut; showBorder: boolean }) {
   return (
     <div
       style={{
-        paddingBottom: 10,
-        marginBottom: 10,
-        borderBottom: "1px solid rgba(255,255,255,0.08)",
+        display: "flex",
+        alignItems: "baseline",
+        gap: 8,
+        padding: "6px 0",
+        borderBottom: showBorder ? "1px solid rgba(255,255,255,0.08)" : "none",
       }}
     >
-      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-        <span style={{ fontSize: 26, fontWeight: 600 }}>{token.surface}</span>
-        <JlptBadge name={token.jlpt_name} />
-      </div>
+      <span style={{ fontSize: 20, fontWeight: 600, flexShrink: 0 }}>{token.surface}</span>
+      <JlptBadge name={token.jlpt_name} />
       {token.reading && (
-        <div style={{ fontSize: 13, opacity: 0.7, marginTop: 2 }}>{token.reading}</div>
+        <span style={{ fontSize: 12, color: "#94a3b8", flexShrink: 0 }}>{token.reading}</span>
       )}
-      {token.meaning && <div style={{ fontSize: 13, marginTop: 6 }}>{token.meaning}</div>}
-      {relatedKanji.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
-          {relatedKanji.map((k) => (
-            <KanjiChip kanji={k} key={k.literal} />
-          ))}
-        </div>
-      )}
-      <SaveButton onClick={save} label="Save word" />
+      <span
+        style={{
+          fontSize: 12,
+          color: "#cbd5e1",
+          marginLeft: "auto",
+          textAlign: "right",
+          overflow: "hidden",
+        }}
+      >
+        {token.meaning ? truncate(token.meaning, MEANING_MAX_CHARS) : ""}
+      </span>
     </div>
   );
+}
+
+/** Top N content words, rarest (N1) first, easiest (N5) last, unknown last. */
+function pickTopWords(tokens: TokenOut[]): TokenOut[] {
+  const contentWords = tokens.filter((t) => t.is_content_word);
+  return [...contentWords]
+    .sort((a, b) => (a.jlpt_level ?? 6) - (b.jlpt_level ?? 6))
+    .slice(0, MAX_WORDS_SHOWN);
 }
 
 function EnglishTranslationEntry({ translation }: { translation: TranslationOut }) {
@@ -150,7 +148,7 @@ function EnglishTranslationEntry({ translation }: { translation: TranslationOut 
     >
       <div style={{ fontSize: 12, opacity: 0.6 }}>{translation.source_text}</div>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 4 }}>
-        <span style={{ fontSize: 26, fontWeight: 600 }}>{translation.translation}</span>
+        <span style={{ fontSize: 22, fontWeight: 600 }}>{translation.translation}</span>
         <JlptBadge name={translation.jlpt_name} />
       </div>
       {translation.reading && (
@@ -182,14 +180,16 @@ function EnglishTranslationEntry({ translation }: { translation: TranslationOut 
           ))}
         </div>
       )}
-      <SaveButton onClick={save} label="Save sentence" />
+      <div style={{ marginTop: 8 }}>
+        <SaveButton onClick={save} label="Save sentence" />
+      </div>
     </div>
   );
 }
 
 function clampToViewport(x: number, y: number): { left: number; top: number } {
   const maxLeft = Math.max(0, window.innerWidth - CARD_MAX_WIDTH - 8);
-  const maxTop = Math.max(0, window.innerHeight - ESTIMATED_CARD_HEIGHT - 8);
+  const maxTop = Math.max(0, window.innerHeight - CARD_MAX_HEIGHT - 8);
   return { left: Math.min(x, maxLeft), top: Math.min(y, maxTop) };
 }
 
@@ -250,24 +250,41 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
 
   if (!displayData) return null;
 
-  // The same kanji can come back several times (once per token it appears in);
-  // collapse to one chip per literal.
-  const uniqueKanji = displayData.kanji.filter(
-    (k, i, arr) => arr.findIndex((x) => x.literal === k.literal) === i,
-  );
-
   const { left, top } = clampToViewport(cursor.x + CURSOR_OFFSET, cursor.y + CURSOR_OFFSET);
+  const topWords = pickTopWords(displayData.tokens);
+  const totalContentWords = displayData.tokens.filter((t) => t.is_content_word).length;
+  const hiddenCount = Math.max(0, totalContentWords - topWords.length);
+
+  const saveAll = () => {
+    for (const t of topWords) {
+      void fetch(SAVE_WORD_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          word: t.surface,
+          reading: t.reading,
+          meaning: t.meaning,
+          jlpt_level: t.jlpt_name,
+          context_sentence: displayData.text,
+        }),
+      });
+    }
+  };
 
   return (
     <div style={{ position: "fixed", left, top, pointerEvents: "none" }}>
       <div
         style={{
           maxWidth: CARD_MAX_WIDTH,
-          backgroundColor: "rgba(26,26,46,0.95)",
-          border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 12,
-          padding: 16,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+          maxHeight: CARD_MAX_HEIGHT,
+          overflow: "hidden",
+          backgroundColor: "rgba(15, 15, 30, 0.92)",
+          backdropFilter: "blur(12px)",
+          WebkitBackdropFilter: "blur(12px)",
+          border: "1px solid rgba(255,255,255,0.08)",
+          borderRadius: 14,
+          padding: "14px 16px",
+          boxShadow: "0 8px 40px rgba(0,0,0,0.5)",
           fontFamily: "system-ui, -apple-system, sans-serif",
           color: "#e2e8f0",
           opacity: visible ? 1 : 0,
@@ -275,11 +292,37 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
           pointerEvents: "auto",
         }}
       >
-        {displayData.tokens
-          .filter((t) => t.is_content_word)
-          .map((t, i) => (
-            <JapaneseWordEntry token={t} kanji={uniqueKanji} key={`ja-${i}`} />
-          ))}
+        {displayData.tokens.length > 0 && (
+          <>
+            <SentenceDisplay tokens={displayData.tokens} />
+            <div
+              style={{
+                height: 1,
+                backgroundColor: "rgba(255,255,255,0.08)",
+                margin: "10px 0",
+              }}
+            />
+            <div>
+              {topWords.map((t, i) => (
+                <WordRow token={t} showBorder={i < topWords.length - 1} key={`word-${i}`} />
+              ))}
+            </div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                marginTop: 10,
+              }}
+            >
+              <span style={{ fontSize: 11, color: "#94a3b8" }}>
+                {totalContentWords} word{totalContentWords === 1 ? "" : "s"} total
+                {hiddenCount > 0 ? ` · ${hiddenCount} more` : ""}
+              </span>
+              <SaveButton onClick={saveAll} label="Save all" />
+            </div>
+          </>
+        )}
         {displayData.translations.map((t, i) => (
           <EnglishTranslationEntry translation={t} key={`en-${i}`} />
         ))}
