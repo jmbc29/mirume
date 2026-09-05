@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "card",
+  "description": "Capability for the hover card window",
+  "windows": ["card"],
+  "permissions": [
+    "core:default",
+    "opener:default"
+  ]
+}

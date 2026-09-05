@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Mirume",
         "width": 1440,
         "height": 900,
@@ -20,6 +21,17 @@
         "resizable": false,
         "fullscreen": false,
         "visible": true
+      },
+      {
+        "label": "card",
+        "title": "Mirume Card",
+        "width": 356,
+        "height": 396,
+        "transparent": true,
+        "decorations": false,
+        "resizable": false,
+        "shadow": false,
+        "visible": false
       }
     ],
     "macOSPrivateApi": true,

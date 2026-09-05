@@ -36,11 +36,10 @@ function persistSet(key: string, value: Set<string>): void {
 
 const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
+// Kept in sync with the "card" window's declared size in tauri.conf.json
+// (356x396 = these + 16px of room for the box-shadow to not get clipped).
 const CARD_MAX_WIDTH = 340;
 const CARD_MAX_HEIGHT = 380;
-/** Extra room (beyond the card's own max size) given to the overlay window
- *  when it shrinks to the card's bounds, so the box-shadow isn't clipped. */
-const WINDOW_PADDING = 16;
 const MAX_WORDS_SHOWN = 3;
 
 const JLPT_COLORS: Record<string, string> = {
@@ -267,7 +266,6 @@ function EnglishTranslationEntry({
 interface HoverCardProps {
   data: HoverResponse | null;
   triggerPoint: CursorPosition;
-  setHoverPaused: (paused: boolean) => void;
 }
 
 /**
@@ -289,7 +287,7 @@ function hasRenderableContent(d: HoverResponse | null): boolean {
   return true;
 }
 
-export default function HoverCard({ data, triggerPoint, setHoverPaused }: HoverCardProps) {
+export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   const [visible, setVisible] = useState(false);
   const [displayData, setDisplayData] = useState<HoverResponse | null>(null);
   // Screen position the card is pinned to. Set once when new data arrives and
@@ -360,9 +358,7 @@ export default function HoverCard({ data, triggerPoint, setHoverPaused }: HoverC
       setDisplayData(null);
       setLockedPosition(null);
       window.clearTimeout(hideTimeoutRef.current);
-      // Grow the overlay back to full-screen click-through so the app
-      // underneath gets clicks again.
-      void invoke("hide_card_window").catch(() => {
+      void invoke("hide_card").catch(() => {
         // Not running inside Tauri (e.g. plain browser dev) — ignore.
       });
       return;
@@ -372,15 +368,12 @@ export default function HoverCard({ data, triggerPoint, setHoverPaused }: HoverC
     setVisible(true);
     window.clearTimeout(hideTimeoutRef.current);
     hideTimeoutRef.current = window.setTimeout(() => setVisible(false), AUTO_HIDE_MS);
-    // Shrink the overlay window down to the card's own rect and make it
-    // capture clicks, so Save actually receives them instead of passing them
-    // through to the app underneath. See lib.rs for why this can't just be
-    // an `ignore` toggle on the (otherwise full-screen) window.
-    void invoke("show_card_window", {
+    // Move the card's own (fixed-size, otherwise-hidden) window to the
+    // trigger point and make it capture clicks, so Save actually receives
+    // them instead of passing them through to the app underneath.
+    void invoke("show_card", {
       x: triggerPoint.x + CURSOR_OFFSET,
       y: triggerPoint.y + CURSOR_OFFSET,
-      width: CARD_MAX_WIDTH + WINDOW_PADDING,
-      height: CARD_MAX_HEIGHT + WINDOW_PADDING,
     }).catch(() => {
       // Not running inside Tauri (e.g. plain browser dev) — ignore.
     });
@@ -405,16 +398,6 @@ export default function HoverCard({ data, triggerPoint, setHoverPaused }: HoverC
   return (
     <div style={{ position: "fixed", left: 0, top: 0, pointerEvents: "none" }}>
       <div
-        // The overlay window is already sized to this card and non-click-
-        // through while visible (see show_card_window above), so these
-        // don't toggle click-through — they pause the mouse tracker's own
-        // /hover polling while the cursor is over the card, so reaching for
-        // Save doesn't fire a new (now-over-the-card, therefore empty)
-        // /hover request that would otherwise clear the card out from under
-        // the cursor. See useMouseTracker's MIN_DISPLAY_MS for the other
-        // half of this fix.
-        onMouseEnter={() => setHoverPaused(true)}
-        onMouseLeave={() => setHoverPaused(false)}
         style={{
           maxWidth: CARD_MAX_WIDTH,
           maxHeight: CARD_MAX_HEIGHT,

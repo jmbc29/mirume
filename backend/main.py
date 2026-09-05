@@ -141,16 +141,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "https://www.deepl.com/pro-api).\n"
         )
 
-    # Warm up the OCR fallback: loading the manga-ocr model takes 2-3 s (and a
-    # one-time ~440 MB weights download), so kick it off now rather than on the
-    # first Chrome hover. Runs on a daemon thread so a slow/absent network never
-    # blocks startup; the (0, 0) capture yields no Japanese and is discarded —
-    # we only want the model resident in memory.
+    # Start the persistent OCR worker thread and warm up its model: loading
+    # PaddleOCR takes several seconds (longer still on a cold weights-download
+    # cache), so kick it off now rather than on the first Chrome hover. Runs
+    # on a daemon thread so a slow/absent network never blocks startup; the
+    # (0, 0) capture yields no Japanese and is discarded — we only want the
+    # worker's model resident in memory. The warmup call gets a generous
+    # timeout since, unlike a real hover, it's the one call that has to
+    # actually wait out the model load rather than give up quickly.
     def _warm_ocr() -> None:
         try:
-            from ocr import extract_text_at_position
+            from ocr import extract_text_at_position, start_ocr_worker
 
-            extract_text_at_position(0, 0)
+            start_ocr_worker()
+            extract_text_at_position(0, 0, timeout=30)
         except Exception as exc:  # pragma: no cover - model/deps optional
             print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
                   "slow on first use or unavailable.")

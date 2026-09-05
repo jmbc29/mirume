@@ -1,70 +1,63 @@
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
-/// Logical (point) size of the overlay's full-screen resting state — the
-/// whole primary monitor, from (0, 0). Captured once in `setup` and used by
-/// `hide_card_window` to restore the window after `show_card_window` has
-/// temporarily shrunk it down to the hover card's own bounds.
-struct FullScreenSize {
-    width: f64,
-    height: f64,
+/// Show the hover card window at ``(x, y)`` and make it capture clicks.
+///
+/// The card lives in its own small, fixed-size window (see `tauri.conf.json`,
+/// label `"card"`) — separate from the full-screen `"main"` overlay, which
+/// stays click-through *forever* and is never resized or repositioned. Two
+/// earlier approaches broke Save clicks for different reasons: toggling
+/// `set_ignore_cursor_events` on the full-screen window let a non-click-
+/// through state block clicks anywhere on screen, and shrinking/growing that
+/// same window to the card's rect on every hover was visually misaligned
+/// with the card's rendered content ("show_card_window"/"hide_card_window",
+/// now removed). A dedicated pre-sized window has neither problem: showing
+/// it just moves it, so the window frame and the card's content — which
+/// fills the window edge to edge — line up exactly, and `"main"` never
+/// changes state at all.
+///
+/// `(x, y)` are logical points and are clamped so the card window never ends
+/// up positioned off the primary monitor (using `"main"`'s size, which is
+/// already stretched to match it — see `setup`).
+#[tauri::command]
+fn show_card(app: tauri::AppHandle, x: f64, y: f64) -> Result<(), String> {
+    let card = app.get_webview_window("card").ok_or("card window not found")?;
+    let scale = card.scale_factor().map_err(|e| e.to_string())?;
+    let card_size = card
+        .outer_size()
+        .map_err(|e| e.to_string())?
+        .to_logical::<f64>(scale);
+
+    let (clamped_x, clamped_y) = match app.get_webview_window("main") {
+        Some(main) => match main.outer_size() {
+            Ok(size) => {
+                let monitor = size.to_logical::<f64>(scale);
+                let max_x = (monitor.width - card_size.width).max(0.0);
+                let max_y = (monitor.height - card_size.height).max(0.0);
+                (x.clamp(0.0, max_x), y.clamp(0.0, max_y))
+            }
+            Err(_) => (x, y),
+        },
+        None => (x, y),
+    };
+
+    card.set_position(tauri::LogicalPosition::new(clamped_x, clamped_y))
+        .map_err(|e| e.to_string())?;
+    card.show().map_err(|e| e.to_string())?;
+    card.set_ignore_cursor_events(false).map_err(|e| e.to_string())
 }
 
-/// Shrink the overlay window to the hover card's bounding rect and make it
-/// capture clicks, so the card's buttons (e.g. Save) receive them instead of
-/// passing them through to the app underneath.
+/// Hide the hover card window and restore its click-through state.
 ///
-/// The overlay normally covers the *entire* primary monitor so the card can
-/// be positioned anywhere with `position: fixed` global coordinates — a
-/// window that size, toggling `set_ignore_cursor_events(false)` on it, would
-/// swallow every click anywhere on screen, not just clicks on the card (this
-/// file used to force click-through permanently on for exactly that reason).
-/// Shrinking the window down to just the card's rect *first* confines
-/// non-click-through to the small area the card actually occupies, then
-/// enables it.
-///
-/// `x`/`y`/`width`/`height` are logical points; `x`/`y` are clamped to the
-/// monitor bounds so the card (and the area that stops being click-through)
-/// never ends up positioned off-screen.
+/// `set_ignore_cursor_events(true)` is set *before* `hide()` — belt and
+/// braces, since a hidden window shouldn't receive events either way, but a
+/// window that somehow got shown again should never do so still capturing
+/// clicks.
 #[tauri::command]
-fn show_card_window(
-    window: tauri::Window,
-    full_screen: tauri::State<'_, FullScreenSize>,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    let max_x = (full_screen.width - width).max(0.0);
-    let max_y = (full_screen.height - height).max(0.0);
-    let clamped_x = x.clamp(0.0, max_x);
-    let clamped_y = y.clamp(0.0, max_y);
-    window
-        .set_size(tauri::LogicalSize::new(width, height))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_position(tauri::LogicalPosition::new(clamped_x, clamped_y))
-        .map_err(|e| e.to_string())?;
-    window.set_ignore_cursor_events(false).map_err(|e| e.to_string())
-}
-
-/// Restore the overlay to its full-screen, click-through resting state.
-///
-/// Re-enables click-through *before* growing the window back to cover the
-/// whole monitor, so there is never an instant where a full-screen window is
-/// also non-click-through.
-#[tauri::command]
-fn hide_card_window(
-    window: tauri::Window,
-    full_screen: tauri::State<'_, FullScreenSize>,
-) -> Result<(), String> {
-    window.set_ignore_cursor_events(true).map_err(|e| e.to_string())?;
-    window
-        .set_size(tauri::LogicalSize::new(full_screen.width, full_screen.height))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_position(tauri::LogicalPosition::new(0.0, 0.0))
-        .map_err(|e| e.to_string())
+fn hide_card(app: tauri::AppHandle) -> Result<(), String> {
+    let card = app.get_webview_window("card").ok_or("card window not found")?;
+    card.set_ignore_cursor_events(true).map_err(|e| e.to_string())?;
+    card.hide().map_err(|e| e.to_string())
 }
 
 /// Return the global cursor position in top-left-origin logical screen points.
@@ -89,67 +82,69 @@ fn get_cursor_position(app: tauri::AppHandle) -> (f64, f64) {
     (0.0, 0.0)
 }
 
+/// Raise `window` above everything, including other apps' native fullscreen
+/// spaces, and make it click-through.
+///
+/// A plain always-on-top window sits at `NSFloatingWindowLevel` and stays on
+/// its origin Space, so it disappears the moment you switch to a fullscreened
+/// app. Two things fix that on macOS: `CanJoinAllSpaces` (so the window is
+/// drawn into every Space, fullscreen ones included) and a window level above
+/// the menu bar. `NSPopUpMenuWindowLevel` clears fullscreen app content and
+/// the menu bar while still staying below screen-saver / critical system
+/// alerts. Applied to both the full-screen overlay and the (much smaller)
+/// hover card window, so the card can appear above a fullscreened Chrome
+/// window too.
+fn configure_overlay_window(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    window.set_always_on_top(true)?;
+    #[cfg(target_os = "macos")]
+    {
+        use objc2_app_kit::{NSPopUpMenuWindowLevel, NSWindow, NSWindowCollectionBehavior};
+        // SAFETY: on macOS `ns_window()` hands back a live NSWindow pointer,
+        // and `setup` runs on the main thread.
+        let ns_window: &NSWindow = unsafe { &*(window.ns_window()?.cast::<NSWindow>()) };
+        ns_window.setLevel(NSPopUpMenuWindowLevel);
+        ns_window.setCollectionBehavior(
+            ns_window.collectionBehavior()
+                | NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+    }
+    window.set_ignore_cursor_events(true)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![
-            show_card_window,
-            hide_card_window,
-            get_cursor_position
-        ])
+        .invoke_handler(tauri::generate_handler![show_card, hide_card, get_cursor_position])
         .setup(|app| {
-            let window = app.get_webview_window("main").expect("main window not found");
+            let main = app.get_webview_window("main").expect("main window not found");
 
             // Stretch the overlay to cover the whole primary monitor from its
-            // top-left corner. The hover card is positioned with `position:
-            // fixed` using global cursor coordinates, so the webview viewport
-            // has to line up 1:1 with the screen or the card lands in the wrong
-            // place (or off-window entirely). The same dimensions are stashed
-            // as managed state so `hide_card_window` can restore them after
-            // `show_card_window` shrinks the window down to the card's rect.
-            let mut full_screen = FullScreenSize { width: 0.0, height: 0.0 };
-            if let Some(monitor) = window.current_monitor()? {
+            // top-left corner. The hover card's own window is positioned in
+            // *this* coordinate space (see show_card), so it has to line up
+            // 1:1 with the screen.
+            if let Some(monitor) = main.current_monitor()? {
                 let size = monitor.size();
                 let scale = monitor.scale_factor();
-                full_screen.width = size.width as f64 / scale;
-                full_screen.height = size.height as f64 / scale;
-                window.set_size(tauri::LogicalSize::new(full_screen.width, full_screen.height))?;
-                window.set_position(tauri::LogicalPosition::new(0.0, 0.0))?;
+                let logical_w = size.width as f64 / scale;
+                let logical_h = size.height as f64 / scale;
+                main.set_size(tauri::LogicalSize::new(logical_w, logical_h))?;
+                main.set_position(tauri::LogicalPosition::new(0.0, 0.0))?;
             }
-            app.manage(full_screen);
+            configure_overlay_window(&main)?;
 
-            // Keep the overlay above everything — including other apps' native
-            // fullscreen spaces. A plain always-on-top window sits at
-            // NSFloatingWindowLevel and stays on its origin Space, so it
-            // disappears the moment you switch to a fullscreened app. Two
-            // things fix that on macOS: CanJoinAllSpaces (so the window is
-            // drawn into every Space, fullscreen ones included) and a window
-            // level above the menu bar. NSPopUpMenuWindowLevel clears
-            // fullscreen app content and the menu bar while still staying
-            // below screen-saver / critical system alerts.
-            window.set_always_on_top(true)?;
-            #[cfg(target_os = "macos")]
-            {
-                use objc2_app_kit::{
-                    NSPopUpMenuWindowLevel, NSWindow, NSWindowCollectionBehavior,
-                };
-                // SAFETY: on macOS `ns_window()` hands back a live NSWindow
-                // pointer, and `setup` runs on the main thread.
-                let ns_window: &NSWindow =
-                    unsafe { &*(window.ns_window()?.cast::<NSWindow>()) };
-                ns_window.setLevel(NSPopUpMenuWindowLevel);
-                ns_window.setCollectionBehavior(
-                    ns_window.collectionBehavior()
-                        | NSWindowCollectionBehavior::CanJoinAllSpaces
-                        | NSWindowCollectionBehavior::Stationary
-                        | NSWindowCollectionBehavior::FullScreenAuxiliary,
-                );
+            // The card window is declared in tauri.conf.json (label "card",
+            // fixed 356x396 size, hidden) and created eagerly alongside
+            // "main" — it just needs the same above-fullscreen treatment and
+            // to start click-through, matching "main"'s permanent state.
+            // show_card/hide_card are the only things that ever touch it
+            // again after this.
+            if let Some(card) = app.get_webview_window("card") {
+                configure_overlay_window(&card)?;
             }
-
-            // Start fully click-through: the overlay must never block the
-            // app underneath it until a hover card is actually showing.
-            window.set_ignore_cursor_events(true)?;
 
             // Cmd+Shift+M toggles the separate review window (word list /
             // flashcards / stats) — a normal, non-transparent window, unlike

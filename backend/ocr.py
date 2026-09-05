@@ -26,6 +26,10 @@ Public API:
   cursor, when it actually contains Japanese, the frontmost app isn't a dev
   tool (see :data:`_OCR_BLOCKED_APPS`), and — when the frontmost app is
   Chrome — the active tab isn't an AI chat site (see :data:`_BLOCKED_DOMAINS`).
+* :func:`start_ocr_worker` – start the persistent background thread that owns
+  the model and every inference call (see :func:`_ocr_worker`); called from
+  ``main.py``'s startup warmup and, idempotently, from every
+  :func:`extract_text_at_position` call in case it hasn't been already.
 * :func:`get_frontmost_app` – name of the active application, used to gate
   OCR off code editors/terminals whose own UI text isn't meant to be read.
 * :func:`get_chrome_url` – active tab URL when Chrome is frontmost, used to
@@ -34,15 +38,16 @@ Public API:
 The detection + recognition model weights (~150 MB total) download once on
 first use into ``~/.paddlex/official_models`` and are cached there by
 ``paddlex``. Loading them into memory is slow (several seconds on a cold
-cache, longer the very first time while the weights download), so
-:func:`extract_text_at_position` loads lazily and caches the model for every
-call after. The backend calls it once during startup warmup so the first real
-hover is fast.
+cache, longer the very first time while the weights download), so the model
+is loaded once by :func:`_ocr_worker` when that thread starts, not per
+request. The backend starts the worker (and warms it up) during startup so
+the first real hover is fast.
 """
 
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -89,12 +94,13 @@ _OCR_REGION_HEIGHT = 300
 #: WindowServer round-trip inside the uvicorn worker) and we abandon it.
 _SCREENCAPTURE_TIMEOUT_S = 2.0
 
-#: How long :func:`extract_text_at_position` waits for the shared inference
-#: slot before giving up on this hover. Capture (~200 ms, or the 2 s
-#: ``screencapture`` timeout) plus inference (~300 ms) is the normal hold
-#: time, so a wait longer than this means calls are stacking up faster than
-#: PaddleOCR can drain them and it is better to skip.
-_OCR_LOCK_WAIT_S = 2.5
+#: How long :func:`extract_text_at_position` waits for the background OCR
+#: worker (see :func:`_ocr_worker`) to answer before giving up on this hover.
+#: Capture (~200 ms, or the 2 s ``screencapture`` timeout) plus inference
+#: (~300 ms), possibly doubled by the one retry pass, is the normal turnaround
+#: time; a wait longer than that means the worker is still busy with a
+#: previous (now stale) request and it's better to skip.
+_OCR_WORKER_TIMEOUT_S = 2.5
 
 #: Codepoint range that counts as "Japanese" — U+3040..U+9FFF spans hiragana,
 #: katakana, the CJK symbols/punctuation block and the CJK unified ideographs
@@ -164,19 +170,23 @@ _ocr_instance = None  # cached paddleocr.PaddleOCR instance
 _ocr_load_failed = False
 _model_lock = threading.Lock()  # serialise the one-time load across threads
 
-#: Last OCR result, keyed by the cursor position it was computed for. A hover
-#: that lands within :data:`_OCR_CACHE_RADIUS` px of the last call reuses this
-#: instead of re-running capture + inference (~2-3s), since a cursor that has
-#: only nudged a few pixels is almost always still over the same line of text.
-_last_ocr_cache: dict = {"x": -9999.0, "y": -9999.0, "text": None}
-_OCR_CACHE_RADIUS = 100
+#: OCR results, keyed by a coarse (:data:`_OCR_CACHE_GRID_PX`-rounded) cursor
+#: position. Several buckets are kept (unlike a single "last position" slot)
+#: so a cursor moving between a few nearby lines — e.g. reading down a
+#: paragraph — hits cache on all of them, not just the most recent. Only ever
+#: touched from :func:`_ocr_worker`, so it needs no lock.
+_ocr_result_cache: dict[tuple[int, int], str | None] = {}
+_OCR_CACHE_GRID_PX = 50
+_OCR_CACHE_MAX_ENTRIES = 50
 
-#: Held for the duration of every capture + PaddleOCR inference. Concurrent
-#: PaddleOCR calls have not shown the crash-on-overlap behaviour manga-ocr's
-#: torch-MPS backend had, but the lock is kept anyway: it's cheap (inference
-#: is ~300 ms) and only one OCR pass is ever useful per hover — the cursor has
-#: usually moved on by the time a second concurrent call would finish.
-_infer_lock = threading.Lock()
+#: Single-slot request queue feeding :func:`_ocr_worker`. ``maxsize=1`` plus
+#: the drop-then-put in :func:`extract_text_at_position` means a burst of
+#: hovers never queues up work for stale positions — only the newest request
+#: is ever waiting, since the cursor has usually moved on by the time an
+#: older one would be processed anyway.
+_ocr_request_queue: "queue.Queue[tuple[float, float, threading.Event]]" = queue.Queue(maxsize=1)
+_ocr_worker_started = False
+_ocr_worker_start_lock = threading.Lock()
 
 
 def _get_model():
@@ -435,10 +445,8 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
     blending into one hallucinated string the way manga-ocr's single
     whole-region pass did.
 
-    Held for the duration of the call: a process-wide lock serialising
-    capture + inference — see :data:`_infer_lock`. If it can't be acquired
-    quickly this returns ``None`` rather than queue — the cursor has usually
-    moved on by the time a second concurrent call would finish.
+    Only ever called from :func:`_ocr_worker`, the single thread that ever
+    touches the model — no lock needed, unlike the old direct-call design.
 
     Returns:
         The recognised text of the closest line, stripped, or ``None`` when
@@ -446,20 +454,15 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
         no detected line clears both :data:`_MIN_OCR_CONFIDENCE` and having
         at least one Japanese character.
     """
-    if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
+    left = x - _OCR_REGION_WIDTH / 2
+    top = y - _OCR_REGION_HEIGHT / 2
+    image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
+    if image is None or not _has_text_contrast(image):
         return None
     try:
-        left = x - _OCR_REGION_WIDTH / 2
-        top = y - _OCR_REGION_HEIGHT / 2
-        image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
-        if image is None or not _has_text_contrast(image):
-            return None
-        try:
-            results = model.predict(np.array(image))
-        except Exception:
-            return None
-    finally:
-        _infer_lock.release()
+        results = model.predict(np.array(image))
+    except Exception:
+        return None
 
     if not results:
         return None
@@ -498,49 +501,121 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
     return text
 
 
-def extract_text_at_position(x: float, y: float) -> str | None:
+def _ocr_cache_key(x: float, y: float) -> tuple[int, int]:
+    """Quantise ``(x, y)`` onto a :data:`_OCR_CACHE_GRID_PX` grid.
+
+    Used as the :data:`_ocr_result_cache` key so nearby-but-not-identical
+    positions (the cursor rarely settles on the exact same point twice) still
+    land in the same bucket.
+    """
+    return (
+        round(x / _OCR_CACHE_GRID_PX) * _OCR_CACHE_GRID_PX,
+        round(y / _OCR_CACHE_GRID_PX) * _OCR_CACHE_GRID_PX,
+    )
+
+
+def _ocr_worker() -> None:
+    """Background thread owning the PaddleOCR model and every inference call.
+
+    Loads the model once (blocking this thread only — real requests just wait
+    on it, see :func:`extract_text_at_position`), then loops pulling
+    ``(x, y, result_event)`` off :data:`_ocr_request_queue` forever. For each:
+    checks :data:`_ocr_result_cache` first; otherwise runs :func:`_run_ocr_pass`
+    at ``(x, y)`` and, if that misses, once more with the region shifted up by
+    :data:`_OCR_RETRY_Y_SHIFT` px (catches a line clipped at the first pass's
+    edge) — then caches and stores the result on ``result_event`` before
+    setting it, waking whichever request thread is waiting.
+
+    Being the sole caller of :func:`_run_ocr_pass`, this thread is also what
+    makes that function's capture+inference lock-free and safe: only one
+    inference ever runs at a time by construction, not by a shared lock.
+
+    Runs for the lifetime of the process; started once by
+    :func:`start_ocr_worker`.
+    """
+    model = _get_model()
+    while True:
+        try:
+            x, y, result_event = _ocr_request_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        cache_key = _ocr_cache_key(x, y)
+        if cache_key in _ocr_result_cache:
+            result_event.result = _ocr_result_cache[cache_key]  # type: ignore[attr-defined]
+            result_event.set()
+            continue
+
+        result: str | None = None
+        if model is not None:
+            result = _run_ocr_pass(model, x, y)
+            if result is None:
+                result = _run_ocr_pass(model, x, y - _OCR_RETRY_Y_SHIFT)
+
+        _ocr_result_cache[cache_key] = result
+        if len(_ocr_result_cache) > _OCR_CACHE_MAX_ENTRIES:
+            # Plain dict preserves insertion order in Python 3.7+, so the
+            # first key really is the oldest entry — good enough for a soft
+            # perf cache; not a strict LRU (a re-hit doesn't move it to the
+            # back), which is an acceptable simplification here.
+            oldest = next(iter(_ocr_result_cache))
+            del _ocr_result_cache[oldest]
+
+        result_event.result = result  # type: ignore[attr-defined]
+        result_event.set()
+
+
+def start_ocr_worker() -> None:
+    """Start the background OCR worker thread, if it isn't already running.
+
+    Idempotent and safe to call from multiple places — both
+    ``main.py``'s startup warmup and every :func:`extract_text_at_position`
+    call do — the underlying thread is only ever created once.
+    """
+    global _ocr_worker_started
+    with _ocr_worker_start_lock:
+        if _ocr_worker_started:
+            return
+        _ocr_worker_started = True
+        threading.Thread(target=_ocr_worker, name="ocr-worker", daemon=True).start()
+
+
+def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TIMEOUT_S) -> str | None:
     """OCR the region around ``(x, y)`` and return the line nearest the cursor.
 
-    Runs :func:`_run_ocr_pass` at ``(x, y)``; if that misses, retries once
-    with the capture region shifted up by :data:`_OCR_RETRY_Y_SHIFT` px,
-    which catches a line that sat right at the edge of (and so was clipped or
-    missed by) the first pass's region.
+    Delegates the actual capture + inference to the persistent
+    :func:`_ocr_worker` thread via :data:`_ocr_request_queue`, rather than
+    running it inline — a burst of hovers this way never backs up behind
+    each other, since a still-queued (and by now stale) request is dropped
+    the moment a newer one arrives.
 
     Args:
         x: Horizontal screen coordinate (top-left origin, points).
         y: Vertical screen coordinate.
+        timeout: How long to wait for the worker to answer before giving up
+            (seconds). The startup warmup call passes a much longer value,
+            since the worker's first job is the one-time model load.
 
     Returns:
         The recognised text of the closest line, stripped, or ``None`` when
-        nothing was captured on either pass, the model is unavailable or
-        busy, the frontmost app is a blocked dev tool
-        (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is a blocked AI chat
-        site (:data:`_BLOCKED_DOMAINS`), the region is too low-contrast to
-        hold text, or no detected line clears both :data:`_MIN_OCR_CONFIDENCE`
-        and having at least one Japanese character.
-
-    The one-time model load happens before any gating or capture, is slow but
-    bounded, and runs once (normally on the startup warmup thread).
-
-    Caching: a hover within :data:`_OCR_CACHE_RADIUS` px of the last call
-    returns the cached result immediately instead of re-running capture +
-    inference — see :data:`_last_ocr_cache`.
+        nothing was captured on either pass, the model is unavailable, the
+        worker didn't answer within ``timeout``, the frontmost app is a
+        blocked dev tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is
+        a blocked AI chat site (:data:`_BLOCKED_DOMAINS`), the region is too
+        low-contrast to hold text, or no detected line clears both
+        :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese
+        character.
     """
-    global _last_ocr_cache
-    dx = x - _last_ocr_cache["x"]
-    dy = y - _last_ocr_cache["y"]
-    if (dx * dx + dy * dy) < _OCR_CACHE_RADIUS**2:
-        return _last_ocr_cache["text"]
+    cache_key = _ocr_cache_key(x, y)
+    if cache_key in _ocr_result_cache:
+        return _ocr_result_cache[cache_key]
 
-    model = _get_model()
-    if model is None:
+    if _get_model() is None:
         return None
 
     # Gated on the frontmost app, not just cursor position: dev tools and
     # this backend's own terminal are never a valid OCR target (VS Code text
-    # the AX tree misses still isn't web content). Checked here rather than
-    # before the model load so the startup warmup call still loads the model
-    # into memory regardless of what's frontmost at that moment.
+    # the AX tree misses still isn't web content).
     frontmost = get_frontmost_app()
     if frontmost in _OCR_BLOCKED_APPS:
         return None
@@ -553,12 +628,26 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         if any(blocked in url for blocked in _BLOCKED_DOMAINS):
             return None
 
-    text = _run_ocr_pass(model, x, y)
-    if text is None:
-        text = _run_ocr_pass(model, x, y - _OCR_RETRY_Y_SHIFT)
+    start_ocr_worker()
 
-    _last_ocr_cache = {"x": x, "y": y, "text": text}
-    return text
+    result_event = threading.Event()
+    result_event.result = None  # type: ignore[attr-defined]
+
+    # Drop a previous, now-stale request rather than let it (or this one)
+    # queue up behind it — only the newest cursor position is ever worth an
+    # OCR pass; the cursor has usually moved on by the time an older request
+    # would be processed anyway.
+    try:
+        _ocr_request_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        _ocr_request_queue.put_nowait((x, y, result_event))
+    except queue.Full:
+        return None
+
+    result_event.wait(timeout=timeout)
+    return result_event.result  # type: ignore[attr-defined]
 
 
 # --------------------------------------------------------------------------- #

@@ -9,7 +9,7 @@ const POLL_MS = 300;
 const MIN_MOVE_PX = 20;
 /** The cursor must sit still (no sample further than MIN_MOVE_PX away) this
  *  long before a /hover request is fired for it. */
-const STILL_MS = 400;
+const STILL_MS = 300;
 /**
  * When a /hover response comes back empty, PaddleOCR may have simply missed
  * the line on this pass (see backend/ocr.py's own retry) — wait this long
@@ -69,7 +69,6 @@ export interface CursorPosition {
 export function useMouseTracker(): MouseTrackerState & {
   cursor: CursorPosition;
   triggerPoint: CursorPosition;
-  setPaused: (paused: boolean) => void;
 } {
   const [state, setState] = useState<MouseTrackerState>({
     data: null,
@@ -89,19 +88,6 @@ export function useMouseTracker(): MouseTrackerState & {
   const requestIdRef = useRef(0);
   // When content last appeared — used to enforce MIN_DISPLAY_MS below.
   const cardShownAtRef = useRef<number | null>(null);
-  // True while the cursor is physically over the card itself (see
-  // HoverCard's onMouseEnter/onMouseLeave). Polling keeps sampling the
-  // cursor while paused, but never fires or schedules a new /hover call —
-  // otherwise moving onto the card to click Save would immediately queue a
-  // fresh hover at that position (now over the card's own window, not the
-  // original text), which comes back empty and clears the card.
-  const pausedRef = useRef(false);
-  const setPaused = (paused: boolean) => {
-    pausedRef.current = paused;
-    if (paused) {
-      window.clearTimeout(stillTimerRef.current);
-    }
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -183,12 +169,6 @@ export function useMouseTracker(): MouseTrackerState & {
         if (cancelled) return;
         setCursor(position);
 
-        if (pausedRef.current) {
-          // Cursor is over the card itself — don't fire or schedule a new
-          // /hover call while the user is interacting with it.
-          return;
-        }
-
         const lastSample = lastSampleRef.current;
         const moved =
           !lastSample ||
@@ -231,5 +211,5 @@ export function useMouseTracker(): MouseTrackerState & {
     };
   }, []);
 
-  return { ...state, cursor, triggerPoint, setPaused };
+  return { ...state, cursor, triggerPoint };
 }

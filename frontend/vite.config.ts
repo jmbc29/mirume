@@ -9,15 +9,17 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
-  // Two HTML entry points: the overlay (index.html, unchanged default) and
+  // Three HTML entry points: the overlay (index.html, unchanged default,
+  // cursor-polling only — no visible UI), the hover card's own small window
+  // (card.html, shown/positioned by src-tauri/src/lib.rs's show_card), and
   // the separate review window (review.html, opened by the Cmd+Shift+M
-  // global shortcut — see src-tauri/src/lib.rs). Only read by `vite build`;
-  // `tauri dev` serves every *.html Vite finds at the project root
-  // regardless of this list.
+  // global shortcut). Only read by `vite build`; `tauri dev` serves every
+  // *.html Vite finds at the project root regardless of this list.
   build: {
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        card: fileURLToPath(new URL("./card.html", import.meta.url)),
         review: fileURLToPath(new URL("./review.html", import.meta.url)),
       },
     },
