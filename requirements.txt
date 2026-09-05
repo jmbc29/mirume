@@ -1,13 +1,31 @@
+# Web server
 fastapi
 uvicorn
-watchfiles  # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree and can wedge the worker
+watchfiles          # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree and can wedge the worker
+
+# macOS Accessibility API + cursor / screenshot (accessibility.py, ocr.py)
 pyobjc-framework-Cocoa
 pyobjc-framework-ApplicationServices
-fugashi
-unidic-lite
+pyobjc-framework-Quartz
+
+# Japanese NLP
+fugashi             # MeCab tokeniser wrapper (tokeniser.py)
+unidic-lite         # dictionary fugashi tokenises against
+fasttext            # lid.176 language identification (language.py)
+
+# Persistence
 sqlalchemy
 pydantic
-requests
+
+# Translation (both optional at runtime — see backend/.env)
 python-dotenv       # translator.py loads backend/.env
-deepl               # translator.py: English<->Japanese via the DeepL API
-anthropic           # translator.py: Claude sentence-translation fallback when DEEPL_API_KEY is unset
+deepl               # translator.py: DeepL English<->Japanese, when DEEPL_API_KEY is set
+anthropic           # translator.py: Claude JA->EN sentence fallback, when ANTHROPIC_API_KEY is set
+
+# OCR fallback for sandboxed content Chrome/Electron don't expose to the AX tree (ocr.py)
+numpy               # imported unconditionally by ocr.py
+pillow
+paddleocr           # pulls in paddlepaddle (~large); OCR degrades gracefully if the import fails
+
+# Misc
+requests            # dictionary / model / Tatoeba downloads
