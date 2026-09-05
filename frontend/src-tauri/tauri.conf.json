@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "Mirume",
+        "url": "index.html",
         "width": 1440,
         "height": 900,
         "transparent": true,
@@ -25,6 +26,7 @@
       {
         "label": "card",
         "title": "Mirume Card",
+        "url": "card.html",
         "width": 356,
         "height": 396,
         "transparent": true,
