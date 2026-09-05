@@ -8,3 +8,6 @@ unidic-lite
 sqlalchemy
 pydantic
 requests
+python-dotenv       # translator.py loads backend/.env
+deepl               # translator.py: English<->Japanese via the DeepL API
+anthropic           # translator.py: Claude sentence-translation fallback when DEEPL_API_KEY is unset

@@ -1,4 +1,4 @@
-"""English → Japanese translation for Mirume, backed by the DeepL API.
+"""Translation for Mirume, backed by DeepL with a Claude fallback.
 
 Mirume's ``/hover`` pipeline is bidirectional: Japanese text gets explained in
 English (:mod:`jlpt`), English text gets translated to Japanese and *then*
@@ -9,9 +9,15 @@ for a casual → formal spread of alternative phrasings, and a run through
 :func:`jlpt.classify_tokens` so the result carries the same JLPT metadata as
 native Japanese text.
 
-Requires a DeepL API key in the environment as ``DEEPL_API_KEY`` (loaded from
-``backend/.env`` via :mod:`dotenv`). Get a free-tier key at
-https://www.deepl.com/pro-api.
+:func:`japanese_to_english` is the other direction — a plain-English rendering
+of the detected sentence for the hover card. It prefers DeepL and falls back to
+the Anthropic API (``claude-sonnet-4-6``) when ``DEEPL_API_KEY`` is not set, so
+a real full-sentence translation is available with either credential.
+
+Configure via ``backend/.env`` (loaded here with :mod:`dotenv`):
+``DEEPL_API_KEY`` (free tier at https://www.deepl.com/pro-api) and/or
+``ANTHROPIC_API_KEY``. With neither, :func:`japanese_to_english` returns
+``None`` and the card omits the translation line.
 """
 
 from __future__ import annotations
@@ -117,28 +123,122 @@ def _translate(text: str, *, formality: str = "default") -> str:
     return result.text
 
 
-def japanese_to_english(text: str) -> str:
-    """Translate Japanese ``text`` to English via DeepL.
+#: Model used for the Claude translation fallback (see japanese_to_english).
+#: Only reached when DeepL is not configured.
+_CLAUDE_TRANSLATION_MODEL = "claude-sonnet-4-6"
 
-    Used by ``/hover`` to show a plain-English gloss of a detected Japanese
-    sentence. This is the only direction that returns a bare string rather than
-    the full JLPT-annotated dict — the English side is just for reading, not
-    for study.
+_CLAUDE_TRANSLATION_SYSTEM = (
+    "You are a translation engine. Translate the user's Japanese text into "
+    "natural, fluent English. Output only the English translation — no notes, "
+    "no preamble, no quotation marks, no romaji."
+)
+
+#: Successful translations keyed by source text. /hover fires this on every
+#: Japanese hover; the same sentence is hovered repeatedly (re-reading, OCR
+#: retries), so a small cache spares both APIs the repeat calls and the user
+#: the added latency. Failures are never cached — a missing key added later,
+#: or a transient network error, should not stick.
+_JA_EN_CACHE: dict[str, str] = {}
+_JA_EN_CACHE_MAX = 256
+
+
+def _anthropic_configured() -> bool:
+    """Whether a Claude credential is present in the environment.
+
+    Checked before attempting the fallback so a backend with neither key set
+    doesn't pay a doomed API round-trip (~0.5 s) on every Japanese hover.
+    """
+    return bool(
+        os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        or os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_anthropic_client():
+    """Return a cached ``anthropic.Anthropic`` client.
+
+    Imported lazily so the module still loads if the package is absent. The
+    client reads ``ANTHROPIC_API_KEY`` (put it in ``backend/.env``).
+    """
+    import anthropic
+
+    # This sits in the /hover request path — keep it snappy: one retry, a
+    # 10 s ceiling, then japanese_to_english returns None and the card shows
+    # without the translation line rather than stalling.
+    return anthropic.Anthropic(max_retries=1, timeout=10.0)
+
+
+def _claude_japanese_to_english(text: str) -> str:
+    """Translate Japanese ``text`` to English with Claude.
+
+    The DeepL fallback: one non-streaming Messages call, response text only.
 
     Args:
         text: Japanese source text.
 
     Returns:
-        The English translation.
-
-    Raises:
-        TranslatorNotConfiguredError: If ``DEEPL_API_KEY`` is unset/empty. The
-            caller is expected to fall back to a word-gloss summary.
+        The English translation (stripped).
     """
-    client = _get_client()
-    # DeepL rejects a bare "EN" target — it wants a regional variant.
-    result = client.translate_text(text, source_lang="JA", target_lang="EN-US")
-    return result.text
+    client = _get_anthropic_client()
+    response = client.messages.create(
+        model=_CLAUDE_TRANSLATION_MODEL,
+        max_tokens=1024,
+        system=_CLAUDE_TRANSLATION_SYSTEM,
+        messages=[{"role": "user", "content": text}],
+    )
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+
+def japanese_to_english(text: str) -> str | None:
+    """Translate Japanese ``text`` to English for the hover card.
+
+    DeepL when ``DEEPL_API_KEY`` is set; otherwise Claude
+    (``claude-sonnet-4-6``). Both return a real full-sentence translation.
+
+    Args:
+        text: Japanese source text.
+
+    Returns:
+        The English translation, or ``None`` when no translator is configured
+        or the call fails — the card just omits the translation line then.
+    """
+    text = text.strip()
+    if not text:
+        return None
+    if text in _JA_EN_CACHE:
+        return _JA_EN_CACHE[text]
+
+    result: str | None = None
+    try:
+        client = _get_client()
+    except TranslatorNotConfiguredError:
+        client = None
+    except Exception:
+        client = None
+    if client is not None:
+        try:
+            # DeepL rejects a bare "EN" target — it wants a regional variant.
+            result = client.translate_text(
+                text, source_lang="JA", target_lang="EN-US"
+            ).text
+        except Exception:
+            result = None
+
+    if not result and _anthropic_configured():
+        try:
+            result = _claude_japanese_to_english(text) or None
+        except Exception:
+            result = None
+
+    if result:
+        try:
+            if len(_JA_EN_CACHE) >= _JA_EN_CACHE_MAX:
+                _JA_EN_CACHE.pop(next(iter(_JA_EN_CACHE)))
+        except (KeyError, StopIteration):
+            pass  # raced with another hover thread — the cache is best-effort
+        _JA_EN_CACHE[text] = result
+    return result
 
 
 def english_to_japanese(text: str) -> dict:

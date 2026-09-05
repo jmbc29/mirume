@@ -548,43 +548,6 @@ def _is_junk_token(token: TokenOut) -> bool:
     return not _JAPANESE_CHAR_RE.search(token.surface)
 
 
-def _gloss_summary(tokens: list[TokenOut], limit: int = 8) -> str:
-    """Join the primary English gloss of the first ``limit`` content words.
-
-    The offline stand-in for a real sentence translation when DeepL is not
-    configured — e.g. ``"typhoon, front, warning, heavy rain"`` for a weather
-    headline. Words are taken in reading order (it reads more like a gist that
-    way than rarest-first would), duplicates dropped.
-
-    Args:
-        tokens: The classified tokens from the current hover.
-        limit: Maximum number of glosses to include.
-
-    Returns:
-        The comma-joined glosses, or ``""`` if no content word had a meaning.
-    """
-    seen: set[str] = set()
-    glosses: list[str] = []
-    for token in tokens:
-        if not (token.is_content_word and token.meaning):
-            continue
-        # `meaning` is senses joined by "; ", each sense a comma-separated gloss
-        # list — take just the very first gloss so the summary stays one word
-        # per token rather than a wall of synonyms.
-        first = re.split(r"[;,]", token.meaning)[0].strip()
-        # A comma split can sever a parenthetical ("Kagoshima (city, ...)" ->
-        # "Kagoshima (city"); drop the dangling fragment.
-        if first.count("(") > first.count(")"):
-            first = first.split("(")[0].strip()
-        key = first.lower()
-        if first and key not in seen:
-            seen.add(key)
-            glosses.append(first)
-        if len(glosses) >= limit:
-            break
-    return ", ".join(glosses)
-
-
 def _segment_by_script(text: str) -> list[tuple[str, str]]:
     """Split ``text`` into contiguous runs of Japanese-script vs Latin-script text.
 
@@ -789,18 +752,17 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
         {k.literal: k for k in (KanjiOut.from_kanji_info(k) for k in get_kanji_breakdown(text))}.values()
     )
 
-    # A plain-English rendering of the Japanese side, shown above the word list.
-    # DeepL when it's configured; otherwise a comma-joined gloss of the notable
-    # words. Never let a translation failure sink the whole hover.
+    # A full-sentence English rendering of the Japanese side, shown above the
+    # word list — DeepL, or Claude when DeepL isn't configured (see
+    # translator.japanese_to_english). Returns None (card omits the line) when
+    # neither is available or the call fails; never sinks the hover.
     sentence_translation: str | None = None
     japanese_text = " ".join(seg for kind, seg in segments if kind == "ja").strip()
     if japanese_text:
         try:
             sentence_translation = japanese_to_english(japanese_text)
-        except TranslatorNotConfiguredError:
-            sentence_translation = _gloss_summary(tokens) or None
-        except Exception:  # DeepL network / quota error — degrade, don't fail.
-            sentence_translation = _gloss_summary(tokens) or None
+        except Exception:
+            sentence_translation = None
 
     return HoverResponse(
         text=text,
