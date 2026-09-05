@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { hasRenderableContent } from "../lib/hoverContent";
 import type { HoverResponse } from "../types/hover";
 
@@ -130,9 +131,29 @@ export function useMouseTracker(): MouseTrackerState & {
   const displayedTriggerRef = useRef<CursorPosition | null>(null);
   // When a (non-retry) /hover call last went out — rate-limits REVALIDATE_MS.
   const lastHoverAtRef = useRef(0);
+  // True while the cursor is physically inside the card's own window — set from
+  // the card window's own mouseenter/mouseleave DOM events, relayed as Tauri
+  // events (see HoverCard.tsx). This is the authoritative "the user is
+  // interacting with the card" signal: the geometric cursorOverCard() guess
+  // can't see a user-resized card or account for the padding gap, but the card
+  // window's real hit-testing can. While pinned the card is never cleared and
+  // drift is never checked — scrolling the word list and dragging toward Save
+  // both fire empty /hover calls that must not tear it down.
+  const isPinnedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
+
+    // The card window tells us when the cursor is over it (HoverCard.tsx emits
+    // these from its own mouseenter/mouseleave). Pinned → never clear the card.
+    const pinListeners = Promise.all([
+      listen("card-mouse-enter", () => {
+        isPinnedRef.current = true;
+      }),
+      listen("card-mouse-leave", () => {
+        isPinnedRef.current = false;
+      }),
+    ]);
 
     const fireHover = async (position: CursorPosition, isRetry = false) => {
       if (!isRetry) {
@@ -170,14 +191,18 @@ export function useMouseTracker(): MouseTrackerState & {
             return;
           }
           const shownMs = cardShownAtRef.current ? Date.now() - cardShownAtRef.current : Infinity;
-          if (shownMs < MIN_DISPLAY_MS && cursorOverCard(position, displayedTriggerRef.current)) {
-            // The card only just appeared and the cursor is now over it — this
-            // non-renderable response is almost certainly from a /hover fired
-            // at the cursor's current spot (e.g. reaching for Save), not
-            // evidence the original text is gone. Keep showing the existing
-            // data. An empty response from anywhere *else* (the cursor moved
-            // off to blank space, the tab/app changed under a still cursor)
-            // falls through and clears the card.
+          if (
+            isPinnedRef.current ||
+            (shownMs < MIN_DISPLAY_MS && cursorOverCard(position, displayedTriggerRef.current))
+          ) {
+            // The cursor is on the card (scrolling the word list, reaching for
+            // Save) — isPinnedRef is the card window's own hit-test; the
+            // geometric check is the backstop for the padding gap and the
+            // moment before the first mouseenter lands. Either way this empty
+            // response is a /hover that fell on the card, not evidence the
+            // original text is gone. An empty response from anywhere *else*
+            // (cursor moved off to blank space, tab/app changed under a still
+            // cursor) falls through and clears the card.
             setState((prev) => ({ ...prev, loading: false, error: null }));
             return;
           }
@@ -193,6 +218,10 @@ export function useMouseTracker(): MouseTrackerState & {
         }
         cardShownAtRef.current = Date.now();
         displayedTriggerRef.current = position;
+        // A fresh card at a new trigger point means the cursor is on the
+        // hovered text, not the (old) card — drop any stale pin and let the
+        // card window's next mouseenter re-set it.
+        isPinnedRef.current = false;
         setTriggerPoint(position);
         setState({ data: json, loading: false, error: null });
       } catch (err) {
@@ -220,6 +249,13 @@ export function useMouseTracker(): MouseTrackerState & {
         if (cancelled) return;
         setCursor(position);
 
+        // Safety net for a "card-mouse-leave" we somehow never received (a fast
+        // exit, the window hiding mid-gesture): once the cursor is plainly away
+        // from the card, drop the pin so hovering can never wedge permanently.
+        if (isPinnedRef.current && !cursorOverCard(position, displayedTriggerRef.current)) {
+          isPinnedRef.current = false;
+        }
+
         const lastSample = lastSampleRef.current;
         const moved =
           !lastSample ||
@@ -231,6 +267,7 @@ export function useMouseTracker(): MouseTrackerState & {
           // a context change that produced no mouse movement (keyboard tab
           // switch, page scroll, app switch) still tears a now-stale card down.
           if (
+            !isPinnedRef.current &&
             displayedTriggerRef.current &&
             Date.now() - lastHoverAtRef.current > REVALIDATE_MS
           ) {
@@ -239,6 +276,14 @@ export function useMouseTracker(): MouseTrackerState & {
           return;
         }
         lastSampleRef.current = position;
+
+        // The cursor is on the card (scrolling the word list, moving toward
+        // Save). Don't touch drift state or fire a fresh /hover — nothing under
+        // the card would resolve to text anyway, and an empty result must not
+        // reach the clear path.
+        if (isPinnedRef.current) {
+          return;
+        }
 
         // The cursor is actively moving again. Once it has drifted far enough
         // from the point that triggered the last /hover call, that reference
@@ -268,6 +313,7 @@ export function useMouseTracker(): MouseTrackerState & {
       cancelled = true;
       window.clearInterval(intervalId);
       window.clearTimeout(stillTimerRef.current);
+      void pinListeners.then((unlisteners) => unlisteners.forEach((fn) => fn()));
     };
   }, []);
 

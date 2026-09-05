@@ -46,4 +46,5 @@ export interface HoverResponse {
   tokens: TokenOut[];
   kanji: KanjiOut[];
   translations: TranslationOut[];
+  sentence_translation: string | null;
 }

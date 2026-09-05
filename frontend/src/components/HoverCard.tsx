@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import { hasRenderableContent } from "../lib/hoverContent";
 import type { GrammarPattern, HoverResponse, TokenOut, TranslationOut } from "../types/hover";
 import type { CursorPosition } from "../hooks/useMouseTracker";
@@ -37,6 +38,20 @@ function persistSet(key: string, value: Set<string>): void {
 
 const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
+
+// Emitted to the "main" window as the cursor enters / leaves the card's own
+// window. useMouseTracker listens for these and "pins" the card while the
+// cursor is on it, so scrolling the word list or reaching for Save — both of
+// which fire /hover calls that land on the card and come back empty — can
+// never clear it out from under the user (see the listeners there).
+const CARD_MOUSE_ENTER = "card-mouse-enter";
+const CARD_MOUSE_LEAVE = "card-mouse-leave";
+
+function emitCardLeave() {
+  void emit(CARD_MOUSE_LEAVE).catch(() => {
+    // Not running inside Tauri (e.g. plain browser dev) — ignore.
+  });
+}
 // Kept in sync with the "card" window's declared size in tauri.conf.json
 // (380x500 = these + 40px: 20px click-through padding on every side, see
 // the root wrapper's `padding` below).
@@ -338,6 +353,7 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
       setDisplayData(null);
       setLockedPosition(null);
       window.clearTimeout(hideTimeoutRef.current);
+      emitCardLeave();
       void invoke("hide_card").catch(() => {
         // Not running inside Tauri (e.g. plain browser dev) — ignore.
       });
@@ -350,7 +366,10 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
     hideTimeoutRef.current = window.setTimeout(() => {
       setVisible(false);
       // Release the card window too — a faded-out card that still owns clicks
-      // would keep eating them over whatever is now underneath it.
+      // would keep eating them over whatever is now underneath it — and unpin
+      // it on the main side so a stale "cursor is on the card" state can't
+      // wedge the next card open.
+      emitCardLeave();
       void invoke("hide_card").catch(() => {
         // Not running inside Tauri (e.g. plain browser dev) — ignore.
       });
@@ -394,6 +413,10 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
       }}
     >
       <div
+        onMouseEnter={() => {
+          void emit(CARD_MOUSE_ENTER).catch(() => {});
+        }}
+        onMouseLeave={emitCardLeave}
         style={{
           display: "flex",
           flexDirection: "column",
@@ -419,6 +442,21 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
             <div style={{ flexShrink: 0 }}>
               <SentenceDisplay tokens={displayData.tokens} />
             </div>
+            {displayData.sentence_translation && (
+              <div
+                style={{
+                  flexShrink: 0,
+                  marginTop: 6,
+                  fontSize: 13,
+                  fontStyle: "italic",
+                  lineHeight: 1.4,
+                  color: "#94a3b8",
+                }}
+              >
+                <span style={{ opacity: 0.5, marginRight: 3 }}>&ldquo;</span>
+                {displayData.sentence_translation}
+              </div>
+            )}
             <div
               style={{
                 flexShrink: 0,
@@ -457,10 +495,30 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
               <span style={{ fontSize: 11, color: "#94a3b8" }}>
                 {contentWords.length} word{contentWords.length === 1 ? "" : "s"} total
               </span>
-              <SaveButton
-                onClick={saveAll}
-                label={`Save all ${contentWords.length} word${contentWords.length === 1 ? "" : "s"}`}
-              />
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                <button
+                  onClick={() => {
+                    void invoke("open_review_window").catch(() => {
+                      // Not running inside Tauri (e.g. plain browser dev) — ignore.
+                    });
+                  }}
+                  style={{
+                    padding: "4px 12px",
+                    borderRadius: 6,
+                    border: "1px solid rgba(255,255,255,0.15)",
+                    background: "transparent",
+                    color: "#94a3b8",
+                    fontSize: 12,
+                    cursor: "pointer",
+                  }}
+                >
+                  Review
+                </button>
+                <SaveButton
+                  onClick={saveAll}
+                  label={`Save all ${contentWords.length} word${contentWords.length === 1 ? "" : "s"}`}
+                />
+              </div>
             </div>
           </>
         )}

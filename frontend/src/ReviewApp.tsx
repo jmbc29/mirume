@@ -115,6 +115,14 @@ function WordListTab() {
     return Object.values(data.by_level).flat();
   }, [data]);
 
+  // Per-level counts for the filter chips, so the word list itself shows the
+  // JLPT breakdown (not just the Stats tab).
+  const countFor = (opt: LevelFilter): number => {
+    if (opt === "All") return allWords.length;
+    if (opt === "Due today") return allWords.filter(isDue).length;
+    return allWords.filter((w) => w.jlpt_level === opt).length;
+  };
+
   const filteredWords = useMemo(() => {
     let words = allWords;
     if (filter === "Due today") {
@@ -162,6 +170,12 @@ function WordListTab() {
 
   return (
     <div>
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 22, fontWeight: 700 }}>{data.total} saved words</div>
+        <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+          {data.due_today} due for review today
+        </div>
+      </div>
       <input
         value={search}
         onChange={(e) => setSearch(e.target.value)}
@@ -193,7 +207,7 @@ function WordListTab() {
               cursor: "pointer",
             }}
           >
-            {opt}
+            {opt} <span style={{ opacity: 0.6 }}>{countFor(opt)}</span>
           </button>
         ))}
         <span style={{ marginLeft: "auto", fontSize: 12, color: "#64748b", alignSelf: "center" }}>

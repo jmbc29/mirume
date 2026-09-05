@@ -90,6 +90,41 @@ fn get_cursor_position(app: tauri::AppHandle) -> (f64, f64) {
     (0.0, 0.0)
 }
 
+/// Show the review window (word list / flashcards / stats), creating it on
+/// first use.
+///
+/// The window is *not* declared in `tauri.conf.json` — it's a normal opaque
+/// window nothing like the overlay, and there's no reason to pay for it until
+/// the user asks. Both the Cmd+Shift+M shortcut and the card's "Review" button
+/// (via the `open_review_window` command) route through here.
+fn show_review_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("review") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else {
+        let _ = tauri::WebviewWindowBuilder::new(
+            app,
+            "review",
+            tauri::WebviewUrl::App("review.html".into()),
+        )
+        .title("Mirume — Review")
+        .inner_size(800.0, 600.0)
+        .resizable(true)
+        .build();
+    }
+}
+
+/// Open the review window from the hover card's "Review" button.
+///
+/// Same effect as pressing Cmd+Shift+M when the window is hidden; unlike the
+/// shortcut this never toggles it back off, since a button press is always an
+/// "I want to see this" and the user can just close the window.
+#[tauri::command]
+fn open_review_window(app: tauri::AppHandle) -> Result<(), String> {
+    show_review_window(&app);
+    Ok(())
+}
+
 /// Raise `window` above everything, including other apps' native fullscreen
 /// spaces, and make it click-through.
 ///
@@ -126,7 +161,12 @@ fn configure_overlay_window(window: &tauri::WebviewWindow) -> tauri::Result<()> 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![show_card, hide_card, get_cursor_position])
+        .invoke_handler(tauri::generate_handler![
+            show_card,
+            hide_card,
+            get_cursor_position,
+            open_review_window
+        ])
         .setup(|app| {
             let main = app.get_webview_window("main").expect("main window not found");
 
@@ -178,24 +218,11 @@ pub fn run() {
                         if event.state() != ShortcutState::Pressed {
                             return;
                         }
-                        if let Some(window) = app.get_webview_window("review") {
-                            let visible = window.is_visible().unwrap_or(false);
-                            if visible {
+                        match app.get_webview_window("review") {
+                            Some(window) if window.is_visible().unwrap_or(false) => {
                                 let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
                             }
-                        } else {
-                            let _ = tauri::WebviewWindowBuilder::new(
-                                app,
-                                "review",
-                                tauri::WebviewUrl::App("review.html".into()),
-                            )
-                            .title("Mirume — Review")
-                            .inner_size(800.0, 600.0)
-                            .resizable(true)
-                            .build();
+                            _ => show_review_window(app),
                         }
                     })
                     .build(),

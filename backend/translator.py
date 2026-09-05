@@ -117,6 +117,30 @@ def _translate(text: str, *, formality: str = "default") -> str:
     return result.text
 
 
+def japanese_to_english(text: str) -> str:
+    """Translate Japanese ``text`` to English via DeepL.
+
+    Used by ``/hover`` to show a plain-English gloss of a detected Japanese
+    sentence. This is the only direction that returns a bare string rather than
+    the full JLPT-annotated dict — the English side is just for reading, not
+    for study.
+
+    Args:
+        text: Japanese source text.
+
+    Returns:
+        The English translation.
+
+    Raises:
+        TranslatorNotConfiguredError: If ``DEEPL_API_KEY`` is unset/empty. The
+            caller is expected to fall back to a word-gloss summary.
+    """
+    client = _get_client()
+    # DeepL rejects a bare "EN" target — it wants a regional variant.
+    result = client.translate_text(text, source_lang="JA", target_lang="EN-US")
+    return result.text
+
+
 def english_to_japanese(text: str) -> dict:
     """Translate English text to Japanese and classify the result by JLPT level.
 
