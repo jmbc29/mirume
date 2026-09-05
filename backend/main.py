@@ -65,6 +65,7 @@ from accessibility import (
     get_focused_text,
     get_text_with_ocr_fallback,
 )
+from ocr import reading_blocked_here
 from database import JMDICT_DB_PATH, MIRUME_DB_PATH, get_mirume_session, init_databases
 from jlpt import (
     ClassifiedToken,
@@ -670,15 +671,8 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
         obtained (``"accessibility"`` vs ``"placeholder"``); ``language``
         describes what was found there (``"ja"``, ``"en"`` or ``"mixed"``).
     """
-    detected, detection_source = get_text_with_ocr_fallback(request.x, request.y)
-    if not detected:
-        detected = get_focused_text()
-        detection_source = "accessibility" if detected else "none"
-
-    if not detected:
-        # Nothing under the cursor from AX, OCR, or the focused element (or no
-        # permission). Return an empty response rather than a placeholder
-        # sentence, so the frontend keeps the hover card hidden.
+    def _empty() -> HoverResponse:
+        """An empty response — the frontend keeps the hover card hidden."""
         return HoverResponse(
             text="",
             source="placeholder",
@@ -688,6 +682,25 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
             kanji=[],
             translations=[],
         )
+
+    # One context gate for every text source below — the AX read at the point,
+    # the OCR fallback, and the focused-element fallback. Checked here (once)
+    # rather than inside each so claude.ai / other blocked surfaces can't leak
+    # through whichever path happens to answer first.
+    if reading_blocked_here():
+        return _empty()
+
+    detected, detection_source = get_text_with_ocr_fallback(
+        request.x, request.y, skip_context_check=True
+    )
+    if not detected:
+        detected = get_focused_text()
+        detection_source = "accessibility" if detected else "none"
+
+    if not detected:
+        # Nothing under the cursor from AX, OCR, or the focused element (or no
+        # permission).
+        return _empty()
     text, source = detected, detection_source
 
     segments = _segment_by_script(text)

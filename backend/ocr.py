@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -196,9 +197,34 @@ _BLOCKED_DOMAINS: frozenset[str] = frozenset(
 # Lazy model loader
 # --------------------------------------------------------------------------- #
 
-_ocr_instance = None  # cached paddleocr.PaddleOCR instance
+#: The detection and recognition models are loaded and used as two separate
+#: stages rather than through ``paddleocr.PaddleOCR``'s combined pipeline. The
+#: combined pipeline recognises *every* line its detector finds in the capture
+#: region — 10+ on a normal text page, ~300 ms each — and :func:`_run_ocr_pass`
+#: then discards all but the one under the cursor. Running detection alone
+#: (~0.5 s) and then recognising only the single nearest box (~60 ms) is the
+#: same result an order of magnitude faster. Both use the exact model files
+#: (``PP-OCRv6_medium_det`` / ``PP-OCRv6_medium_rec``) that ``PaddleOCR(lang=
+#: "japan")`` loads anyway.
+_det_instance = None  # cached paddleocr.TextDetection
+_rec_instance = None  # cached paddleocr.TextRecognition
 _ocr_load_failed = False
 _model_lock = threading.Lock()  # serialise the one-time load across threads
+
+_DET_MODEL_NAME = "PP-OCRv6_medium_det"
+_REC_MODEL_NAME = "PP-OCRv6_medium_rec"
+
+#: Padding (px) added around a detected box before it is cropped out for
+#: recognition — the detector's polygon hugs the glyphs tight and the
+#: recogniser reads a hair more accurately with a little margin.
+_CROP_PAD_PX = 4
+
+#: Cap on how many of the nearest detected boxes are actually recognised in a
+#: single pass. The box under the cursor is almost always the first; the extra
+#: few cover the case where the nearest box is non-Japanese UI text that the
+#: Japanese-character filter rejects. Bounds a pass at ~5 * 60 ms of
+#: recognition on top of the one detection call.
+_MAX_RECOGNISE_PER_PASS = 5
 
 #: OCR results, keyed by a coarse (:data:`_OCR_CACHE_GRID_PX`-rounded) cursor
 #: position. Several buckets are kept (unlike a single "last position" slot)
@@ -219,51 +245,47 @@ _ocr_worker_started = False
 _ocr_worker_start_lock = threading.Lock()
 
 
-def _get_model():
-    """Return a cached ``PaddleOCR`` instance, loading it on first call.
+def _get_models():
+    """Return the cached ``(TextDetection, TextRecognition)`` pair, loading once.
 
     Thread-safe: the startup warmup thread and a racing first request would
-    otherwise both build a ``PaddleOCR`` instance (each a multi-second load,
-    longer still on the very first run while weights download). The lock lets
-    the first caller do the load while the rest wait for it.
+    otherwise both build the models (each a multi-second load, longer still on
+    the very first run while weights download). The lock lets the first caller
+    do the load while the rest wait for it.
 
     Returns:
-        The ``paddleocr.PaddleOCR`` instance, or ``None`` if paddleocr is not
-        installed or the model could not be loaded (logged once).
+        A ``(det, rec)`` tuple, or ``None`` if paddleocr is not installed or the
+        models could not be loaded (logged once).
     """
-    global _ocr_instance, _ocr_load_failed
-    if _ocr_instance is not None:
-        return _ocr_instance
+    global _det_instance, _rec_instance, _ocr_load_failed
+    if _det_instance is not None and _rec_instance is not None:
+        return _det_instance, _rec_instance
     if _ocr_load_failed:
         return None
     with _model_lock:
-        if _ocr_instance is not None:
-            return _ocr_instance
+        if _det_instance is not None and _rec_instance is not None:
+            return _det_instance, _rec_instance
         if _ocr_load_failed:
             return None
         try:
-            from paddleocr import PaddleOCR
+            from paddleocr import TextDetection, TextRecognition
         except Exception as exc:  # pragma: no cover - dependency missing
             print(f"[mirume] paddleocr not available ({exc}); OCR fallback disabled.")
             _ocr_load_failed = True
             return None
         try:
             print(
-                "[mirume] loading PaddleOCR model (first use, several seconds; "
+                "[mirume] loading PaddleOCR models (first use, several seconds; "
                 "longer on first run while weights download)...",
                 file=sys.stderr,
             )
-            _ocr_instance = PaddleOCR(
-                lang="japan",
-                use_textline_orientation=False,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-            )
+            _det_instance = TextDetection(model_name=_DET_MODEL_NAME)
+            _rec_instance = TextRecognition(model_name=_REC_MODEL_NAME)
         except Exception as exc:  # pragma: no cover - runtime/model failure
-            print(f"[mirume] failed to load PaddleOCR model ({exc}); OCR disabled.")
+            print(f"[mirume] failed to load PaddleOCR models ({exc}); OCR disabled.")
             _ocr_load_failed = True
             return None
-    return _ocr_instance
+    return _det_instance, _rec_instance
 
 
 # --------------------------------------------------------------------------- #
@@ -444,6 +466,98 @@ def get_chrome_url() -> str:
         return ""
 
 
+#: Cache for :func:`_frontmost_context` — ``(monotonic_deadline, (app, url))``.
+#: ``/hover`` fires in bursts as the cursor settles and the frontend retries, so
+#: without this every one of those would pay a fresh ``osascript`` round-trip
+#: (~250 ms) just to re-learn the app hasn't changed. A short TTL keeps the gate
+#: honest — you would have to switch to a blocked app *and* hover within the
+#: window for a stale "not blocked" to slip through.
+_CONTEXT_TTL_S = 0.5
+_context_cache: tuple[float, tuple[str, str]] | None = None
+_context_lock = threading.Lock()
+
+
+def _frontmost_context() -> tuple[str, str]:
+    """Return ``(frontmost app name, active Chrome tab URL)`` in one round-trip.
+
+    A single ``osascript`` call gets the frontmost process name and, only when
+    that is Chrome, its active tab URL (lowercased) — half the subprocess spawn
+    cost of calling :func:`get_frontmost_app` and :func:`get_chrome_url`
+    separately. The result is cached for :data:`_CONTEXT_TTL_S`.
+
+    Returns:
+        ``(app, url)``; ``url`` is ``""`` when Chrome isn't frontmost or its
+        URL couldn't be read. ``("", "")`` if the whole call failed.
+    """
+    global _context_cache
+    now = time.monotonic()
+    cached = _context_cache
+    if cached is not None and now < cached[0]:
+        return cached[1]
+
+    script = """
+    tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+    end tell
+    set theURL to ""
+    if frontApp is "Google Chrome" then
+        try
+            tell application "Google Chrome" to set theURL to URL of active tab of front window
+        end try
+    end if
+    return frontApp & linefeed & theURL
+    """
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        app, _, url = result.stdout.strip().partition("\n")
+        context = (app.strip(), url.strip().lower())
+    except Exception:
+        context = ("", "")
+
+    with _context_lock:
+        _context_cache = (now + _CONTEXT_TTL_S, context)
+    return context
+
+
+def reading_blocked_here() -> bool:
+    """Whether Mirume should read *nothing* from whatever is frontmost right now.
+
+    This gates **both** text sources — the Accessibility tree and the OCR
+    fallback — not just OCR. It used to guard only OCR (inside
+    :func:`extract_text_at_position`), but once Mirume's cursor polling has
+    nudged Chrome into exposing its renderer accessibility tree, a blocked
+    site's text (an AI chat, this repo on GitHub, a localhost dev server)
+    flows straight out through :func:`accessibility.get_text_at_position`
+    with the OCR gate never consulted. So the check has to happen before the
+    AX read too — which is what :func:`accessibility.get_text_with_ocr_fallback`
+    now does by calling this first.
+
+    Blocked when the frontmost app is a dev tool / terminal / Claude itself
+    (:data:`_OCR_BLOCKED_APPS`), or when it is Chrome and the active tab's URL
+    is a blocked domain (:data:`_BLOCKED_DOMAINS`) — *or* Chrome is frontmost
+    but its URL could not be read at all. That last case fails **closed** on
+    purpose: an ``osascript`` timeout used to make :func:`get_chrome_url`
+    return ``""``, which the old ``any(domain in url ...)`` check waved
+    through as "not blocked". We know it's a browser; if we can't confirm the
+    tab is safe, we don't read it.
+
+    Returns:
+        ``True`` if nothing under the cursor should be read right now.
+    """
+    frontmost, url = _frontmost_context()
+    if frontmost in _OCR_BLOCKED_APPS:
+        return True
+    if frontmost == "Google Chrome":
+        if not url or any(domain in url for domain in _BLOCKED_DOMAINS):
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -485,75 +599,112 @@ def _collapse_repeated_text(text: str) -> str:
     return _REPEATED_UNIT_RE.sub(r"\1", text)
 
 
-def _run_ocr_pass(model, x: float, y: float) -> str | None:
-    """Capture + recognise a single :data:`_OCR_REGION_WIDTH` x
-    :data:`_OCR_REGION_HEIGHT` region centred on ``(x, y)``.
+def _detected_boxes_near_cursor(det, image) -> list[tuple[float, tuple[int, int, int, int]]]:
+    """Run detection on ``image`` and return the boxes within reach of the cursor.
 
-    Of everything PaddleOCR's detector finds in that region, only the
-    recognised text of the box whose centre sits closest to ``(x, y)`` — the
-    exact centre of the capture — is returned. This is what keeps a dense
-    page — several unrelated lines of text within the capture region — from
-    blending into one hallucinated string the way manga-ocr's single
+    The capture region is centred on the cursor, so the cursor is at the exact
+    centre of ``image``. Every detected polygon within
+    :data:`_OCR_MAX_BOX_DISTANCE_PX` of that centre is returned as
+    ``(distance, (x1, y1, x2, y2))`` — the axis-aligned bounding box, padded by
+    :data:`_CROP_PAD_PX` and clamped to the image — sorted nearest first.
+
+    Args:
+        det: The ``paddleocr.TextDetection`` instance.
+        image: The captured :class:`PIL.Image.Image`.
+
+    Returns:
+        Nearest-first ``(distance, bbox)`` list; empty if detection found
+        nothing (or nothing close enough).
+    """
+    try:
+        results = det.predict(np.array(image))
+    except Exception:
+        return []
+    if not results:
+        return []
+    polys = results[0].get("dt_polys")
+    if polys is None or len(polys) == 0:
+        return []
+
+    cx, cy = image.width / 2, image.height / 2
+    near: list[tuple[float, tuple[int, int, int, int]]] = []
+    for poly in polys:
+        xs = [float(p[0]) for p in poly]
+        ys = [float(p[1]) for p in poly]
+        box_cx, box_cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        distance = ((box_cx - cx) ** 2 + (box_cy - cy) ** 2) ** 0.5
+        if distance > _OCR_MAX_BOX_DISTANCE_PX:
+            continue
+        x1 = max(0, int(min(xs)) - _CROP_PAD_PX)
+        y1 = max(0, int(min(ys)) - _CROP_PAD_PX)
+        x2 = min(image.width, int(max(xs)) + _CROP_PAD_PX)
+        y2 = min(image.height, int(max(ys)) + _CROP_PAD_PX)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        near.append((distance, (x1, y1, x2, y2)))
+    near.sort(key=lambda item: item[0])
+    return near
+
+
+def _run_ocr_pass(models, x: float, y: float) -> str | None:
+    """Capture a :data:`_OCR_REGION_WIDTH` x :data:`_OCR_REGION_HEIGHT` region
+    centred on ``(x, y)`` and recognise the line under the cursor.
+
+    Detection is run over the whole region (it needs the vertical context to
+    separate the cursor's line from its neighbours), but **recognition is run
+    only on the box nearest the cursor** — walking outward to the next few
+    boxes only if the nearest turns out to be non-Japanese UI text. The old
+    code ran ``PaddleOCR.predict()``, which recognises *every* detected line
+    (10+ on a text page, ~300 ms each) and then threw all but one away — that
+    was the multi-second hover.
+
+    Of everything the detector finds, only the box whose centre sits closest to
+    ``(x, y)`` (the exact centre of the capture) is used, so a dense page
+    never blends into one hallucinated string the way manga-ocr's single
     whole-region pass did.
 
     Only ever called from :func:`_ocr_worker`, the single thread that ever
-    touches the model — no lock needed, unlike the old direct-call design.
+    touches the models — no lock needed, unlike the old direct-call design.
+
+    Args:
+        models: The ``(det, rec)`` pair from :func:`_get_models`.
+        x: Horizontal screen coordinate the region is centred on.
+        y: Vertical screen coordinate the region is centred on.
 
     Returns:
-        The recognised text of the closest line, stripped, or ``None`` when
-        nothing was captured, the region is too low-contrast to hold text, no
-        detected line clears both :data:`_MIN_OCR_CONFIDENCE` and having at
-        least one Japanese character, or the closest qualifying line is
-        farther than :data:`_OCR_MAX_BOX_DISTANCE_PX` from the cursor (it's
-        whitespace between blocks, not a line the cursor is actually on).
+        The recognised text of the closest qualifying line, stripped, or
+        ``None`` when nothing was captured, the region is too low-contrast to
+        hold text, the detector found no box within
+        :data:`_OCR_MAX_BOX_DISTANCE_PX` of the cursor, or none of the nearest
+        :data:`_MAX_RECOGNISE_PER_PASS` boxes clears both
+        :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese character.
     """
+    det, rec = models
     left = x - _OCR_REGION_WIDTH / 2
     top = y - _OCR_REGION_HEIGHT / 2
     image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
     if image is None or not _has_text_contrast(image):
         return None
-    try:
-        results = model.predict(np.array(image))
-    except Exception:
-        return None
 
-    if not results:
-        return None
-    result = results[0]
-    texts = result.get("rec_texts") or []
-    scores = result.get("rec_scores") or []
-    boxes = result.get("rec_boxes")
-    if boxes is None or len(texts) == 0:
-        return None
-
-    # The capture region is centred on (x, y), so that point sits at the
-    # exact centre of the image regardless of its value — the closest
-    # detected line to that point is the one the user is actually pointing at.
-    cursor_in_image = (_OCR_REGION_WIDTH / 2, _OCR_REGION_HEIGHT / 2)
-    best_text: str | None = None
-    best_distance = float("inf")
-    for text, score, box in zip(texts, scores, boxes):
-        if score < _MIN_OCR_CONFIDENCE:
+    array = np.array(image)
+    for _distance, (x1, y1, x2, y2) in _detected_boxes_near_cursor(det, image)[
+        :_MAX_RECOGNISE_PER_PASS
+    ]:
+        try:
+            results = rec.predict(array[y1:y2, x1:x2])
+        except Exception:
             continue
-        if not _JAPANESE_RE.search(text):
+        if not results:
             continue
-        box_x1, box_y1, box_x2, box_y2 = (float(v) for v in box[:4])
-        box_center = ((box_x1 + box_x2) / 2, (box_y1 + box_y2) / 2)
-        distance = (
-            (box_center[0] - cursor_in_image[0]) ** 2 + (box_center[1] - cursor_in_image[1]) ** 2
-        ) ** 0.5
-        if distance < best_distance:
-            best_distance = distance
-            best_text = text
-
-    if best_text is None:
-        return None
-    if best_distance > _OCR_MAX_BOX_DISTANCE_PX:
-        return None
-    text = _collapse_repeated_text(best_text.strip())
-    if len(text) < 2:
-        return None
-    return text
+        text = (results[0].get("rec_text") or "").strip()
+        score = float(results[0].get("rec_score") or 0.0)
+        if score < _MIN_OCR_CONFIDENCE or not _JAPANESE_RE.search(text):
+            continue
+        text = _collapse_repeated_text(text)
+        if len(text) < 2:
+            continue
+        return text
+    return None
 
 
 def _ocr_cache_key(x: float, y: float) -> tuple[int, int]:
@@ -569,27 +720,22 @@ def _ocr_cache_key(x: float, y: float) -> tuple[int, int]:
     )
 
 
-def _warm_up_inference(model) -> None:
-    """Run one throwaway inference pass before the worker starts serving requests.
+def _warm_up_inference(models) -> None:
+    """Run one throwaway detect + recognise pass before the worker serves requests.
 
-    Measured directly (2026-09): a fresh ``model.predict()`` call on a
-    600x300 image (the real capture size) costs ~0.5s whether or not an
-    earlier call already ran one — there's no separate "first-call is much
-    slower" tax to amortize in this setup, so this isn't what was behind a
-    multi-second stall (see :func:`extract_text_at_position`'s
-    ``_ocr_instance`` check for the actual fix for that). Kept anyway as a
-    cheap, harmless sanity check that the loaded model can really run
-    inference before the worker advertises itself as ready — and the old
-    version of this warmup call (through :func:`extract_text_at_position`,
-    with frontmost-app gating still active) would return at the gate before
-    ever reaching ``model.predict()`` at all, since the backend's own
-    launching terminal is almost always frontmost at startup. This bypasses
-    all gating by construction: called directly on a blank image, never
-    through :func:`extract_text_at_position`.
+    A cheap sanity check that both loaded models can actually run inference
+    before the worker advertises itself as ready. Bypasses all gating by
+    construction: called on a blank in-memory image, never through
+    :func:`extract_text_at_position` (whose frontmost-app gate would return
+    early at startup — the backend's own launching terminal is frontmost then).
+
+    Args:
+        models: The ``(det, rec)`` pair from :func:`_get_models`.
     """
+    det, rec = models
     try:
-        blank = np.zeros((100, 300, 3), dtype=np.uint8)
-        model.predict(blank)
+        det.predict(np.zeros((_OCR_REGION_HEIGHT, _OCR_REGION_WIDTH, 3), dtype=np.uint8))
+        rec.predict(np.zeros((48, 240, 3), dtype=np.uint8))
     except Exception as exc:  # pragma: no cover - warmup is best-effort
         print(f"[mirume] OCR inference warmup failed ({exc}); first real hover may be slow.")
 
@@ -614,9 +760,9 @@ def _ocr_worker() -> None:
     Runs for the lifetime of the process; started once by
     :func:`start_ocr_worker`.
     """
-    model = _get_model()
-    if model is not None:
-        _warm_up_inference(model)
+    models = _get_models()
+    if models is not None:
+        _warm_up_inference(models)
     while True:
         try:
             x, y, result_event = _ocr_request_queue.get(timeout=1)
@@ -630,10 +776,10 @@ def _ocr_worker() -> None:
             continue
 
         result: str | None = None
-        if model is not None:
-            result = _run_ocr_pass(model, x, y)
+        if models is not None:
+            result = _run_ocr_pass(models, x, y)
             if result is None:
-                result = _run_ocr_pass(model, x, y - _OCR_RETRY_Y_SHIFT)
+                result = _run_ocr_pass(models, x, y - _OCR_RETRY_Y_SHIFT)
 
         _ocr_result_cache[cache_key] = result
         if len(_ocr_result_cache) > _OCR_CACHE_MAX_ENTRIES:
@@ -663,7 +809,13 @@ def start_ocr_worker() -> None:
         threading.Thread(target=_ocr_worker, name="ocr-worker", daemon=True).start()
 
 
-def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TIMEOUT_S) -> str | None:
+def extract_text_at_position(
+    x: float,
+    y: float,
+    timeout: float = _OCR_WORKER_TIMEOUT_S,
+    *,
+    skip_context_check: bool = False,
+) -> str | None:
     """OCR the region around ``(x, y)`` and return the line nearest the cursor.
 
     Delegates the actual capture + inference to the persistent
@@ -678,31 +830,30 @@ def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TI
         timeout: How long to wait for the worker to answer before giving up
             (seconds). The startup warmup call passes a much longer value,
             since the worker's first job is the one-time model load.
+        skip_context_check: Set by :func:`accessibility.get_text_with_ocr_fallback`,
+            which has *already* called :func:`reading_blocked_here` before its
+            AX read — no point paying the ~0.5 s of ``osascript`` round-trips
+            again. Any other caller leaves this ``False`` so the gate still
+            runs.
 
     Returns:
         The recognised text of the closest line, stripped, or ``None`` when
-        nothing was captured on either pass, the model is unavailable, the
-        worker didn't answer within ``timeout``, the frontmost app is a
-        blocked dev tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is
-        a blocked AI chat site (:data:`_BLOCKED_DOMAINS`), the region is too
-        low-contrast to hold text, or no detected line clears both
-        :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese
-        character.
+        nothing was captured on either pass, the models are unavailable, the
+        worker didn't answer within ``timeout``, reading is blocked here
+        (:func:`reading_blocked_here`), the region is too low-contrast to hold
+        text, or no detected line clears both :data:`_MIN_OCR_CONFIDENCE` and
+        having at least one Japanese character.
 
-    Gating (frontmost app / Chrome URL) runs *before* the cache lookup, not
+    Gating (:func:`reading_blocked_here`) runs *before* the cache lookup, not
     after. It used to run after, which meant a hover that landed on an
     already-cached screen position skipped gating entirely — so switching
     from an allowed app/tab to a blocked one (e.g. an NHK Chrome tab to a
     claude.ai tab) without moving the cursor would still return the
-    *previous* tab's cached text for that same screen coordinate, since the
-    cache was consulted first and gating never got a chance to say no.
-    ``get_frontmost_app()`` costs ~10-50 ms, trivial next to the OCR pass a
-    cache hit exists to save, so paying it on every call (not just cache
-    misses) is a small, worthwhile price for correctness.
+    *previous* tab's cached text for that same screen coordinate.
 
-    Checks ``_ocr_instance`` directly rather than calling :func:`_get_model`
-    here — :func:`_get_model` blocks on ``_model_lock`` with no timeout
-    while the model loads (several seconds, longer on a cold weights-
+    Checks ``_det_instance`` directly rather than calling :func:`_get_models`
+    here — :func:`_get_models` blocks on ``_model_lock`` with no timeout
+    while the models load (several seconds, longer on a cold weights-
     download), and a hover landing during that window would otherwise
     block this whole request for however much of the load remains. The
     worker thread (see :func:`_ocr_worker`) is the one place that should
@@ -710,23 +861,10 @@ def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TI
     same as "not available" and returns fast — the next hover, once loading
     finishes, proceeds normally.
     """
-    if _ocr_instance is None:
+    if _det_instance is None or _rec_instance is None:
         return None
 
-    # Gated on the frontmost app, not just cursor position: dev tools and
-    # this backend's own terminal are never a valid OCR target (VS Code text
-    # the AX tree misses still isn't web content).
-    frontmost = get_frontmost_app()
-    blocked = frontmost in _OCR_BLOCKED_APPS
-
-    # The app-level check above sees "Google Chrome" for every website, so
-    # AI chat sites need a second, URL-based gate — otherwise Mirume reads
-    # Claude's own Japanese-language replies as text to classify.
-    if not blocked and frontmost == "Google Chrome":
-        url = get_chrome_url()
-        blocked = any(domain in url for domain in _BLOCKED_DOMAINS)
-
-    if blocked:
+    if not skip_context_check and reading_blocked_here():
         # Drop anything still queued for the worker too — it was enqueued
         # for a screen position that's no longer valid to OCR (the app/tab
         # changed since), so there's no point letting it run.
@@ -790,5 +928,14 @@ if __name__ == "__main__":
         else:
             print("capture failed (Screen Recording permission?)")
 
-    result = extract_text_at_position(args.x, args.y)
+    # Load the models and start the worker so a bare `python ocr.py X Y` run
+    # actually exercises the pipeline instead of returning early on the
+    # "models not loaded yet" guard.
+    start_ocr_worker()
+    for _ in range(60):
+        if _det_instance is not None and _rec_instance is not None:
+            break
+        time.sleep(0.5)
+
+    result = extract_text_at_position(args.x, args.y, timeout=10.0)
     print("ocr result:", repr(result))

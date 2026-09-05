@@ -231,8 +231,53 @@ def _extract_text(element: object | None, depth: int = _MAX_DESCEND_DEPTH) -> st
             if collected >= _MAX_TEXT_CHARS:
                 break
 
-    combined = _clean(" ".join(parts))
+    combined = _clean(" ".join(_dedupe_nested_text(parts)))
     return combined or None
+
+
+def _dedupe_nested_text(parts: list[str]) -> list[str]:
+    """Drop parts that just repeat text already carried by another part.
+
+    A real web page's AX subtree routinely exposes the same rendered line
+    twice: once split across inline nodes (``警戒`` / ``前線`` / ``が`` …) and
+    once coalesced at the block node (``警戒前線が…``). Naively joining every
+    child's text then repeats every word — ``"警戒 前線 が 接近 しています
+    警戒前線が接近しています"`` — which tokenises to 警戒 ×2, 前線 ×2, and shows
+    each word twice (or more, the deeper the nesting) in the hover card.
+
+    A part is dropped when its text, with whitespace removed, is empty, an
+    exact duplicate of an earlier kept part, or a substring of any other
+    part. Comparison ignores whitespace because the split and coalesced forms
+    differ only by the spaces ``_clean``/the join introduce between inline
+    nodes.
+
+    Args:
+        parts: Child texts collected in document order.
+
+    Returns:
+        ``parts`` with the redundant entries removed, order preserved. Never
+        returns empty when ``parts`` had any non-blank entry.
+    """
+    normalised = [(p, re.sub(r"\s+", "", p)) for p in parts]
+    non_blank = [(p, n) for p, n in normalised if n]
+    if not non_blank:
+        return []
+
+    kept: list[str] = []
+    kept_norms: list[str] = []
+    for part, norm in non_blank:
+        if norm in kept_norms:
+            continue
+        if any(norm != other and norm in other for _, other in non_blank):
+            continue
+        kept.append(part)
+        kept_norms.append(norm)
+
+    # Every part was a substring of some other (mutually-overlapping fragments
+    # with no single superset) — keep the longest so we still return text.
+    if not kept:
+        return [max(non_blank, key=lambda pn: len(pn[1]))[0]]
+    return kept
 
 
 # --------------------------------------------------------------------------- #
@@ -291,39 +336,57 @@ def get_focused_text() -> str | None:
         return None
 
 
-def get_text_with_ocr_fallback(x: float, y: float) -> tuple[str | None, str]:
+def get_text_with_ocr_fallback(
+    x: float, y: float, *, skip_context_check: bool = False
+) -> tuple[str | None, str]:
     """Return the text under ``(x, y)`` and how it was obtained.
 
-    Tries the Accessibility API first (fast, exact, but blind to sandboxed
-    renderers like Chrome's web content). If that finds nothing, falls back to
-    a screenshot + manga-ocr pass (:func:`ocr.extract_text_at_position`) —
-    but only when the frontmost app isn't a dev tool / terminal
-    (``ocr._OCR_BLOCKED_APPS``), since OCR has no way to tell "sandboxed web
-    content the AX tree can't see" apart from "a code editor's own UI text
-    the AX tree also happens to miss".
+    The context gate (:func:`ocr.reading_blocked_here`) runs **first**, before
+    the AX read — not just before the OCR fallback. It used to guard only OCR,
+    on the assumption that Chrome web content is invisible to the AX tree. It
+    isn't reliably: once Mirume's cursor polling has nudged Chrome into
+    exposing its renderer accessibility tree, a blocked site's text (an AI
+    chat, this repo on GitHub, a localhost dev server) comes straight back
+    through :func:`get_text_at_position` as ``source="accessibility"`` with
+    the gate never consulted — which is exactly how the hover card ended up
+    showing on claude.ai.
+
+    With the gate passed, the Accessibility API is tried first (fast, exact),
+    then a screenshot + OCR pass (:func:`ocr.extract_text_at_position`) for
+    content the AX tree doesn't expose.
 
     Args:
         x: Horizontal screen coordinate (top-left origin, points).
         y: Vertical screen coordinate.
+        skip_context_check: Set by a caller that has already called
+            :func:`ocr.reading_blocked_here` itself (``main._hover_sync``
+            does, so it can gate :func:`get_focused_text` by the same
+            decision) — avoids a second round of ``osascript`` round-trips.
 
     Returns:
         ``(text, "accessibility")`` if the AX tree had text, ``(text, "ocr")``
-        if OCR recovered it, or ``(None, "none")`` if both failed or the
-        frontmost app is blocked from OCR.
+        if OCR recovered it, or ``(None, "none")`` if both failed or reading is
+        blocked in the current context.
     """
+    try:
+        from ocr import extract_text_at_position, reading_blocked_here
+    except Exception:
+        # OCR module unavailable — no gate to run and no fallback; a bare AX
+        # read is all that's left.
+        ax_text = get_text_at_position(x, y)
+        return (ax_text, "accessibility") if ax_text else (None, "none")
+
+    if not skip_context_check and reading_blocked_here():
+        return None, "none"
+
     ax_text = get_text_at_position(x, y)
     if ax_text:
         return ax_text, "accessibility"
 
-    try:
-        from ocr import _OCR_BLOCKED_APPS, extract_text_at_position, get_frontmost_app
-    except Exception:
-        return None, "none"
-
-    if get_frontmost_app() in _OCR_BLOCKED_APPS:
-        return None, "none"
-
-    ocr_text = extract_text_at_position(x, y)
+    # reading_blocked_here() already ran the frontmost-app / Chrome-URL
+    # osascript round-trips — don't make extract_text_at_position pay them
+    # again.
+    ocr_text = extract_text_at_position(x, y, skip_context_check=True)
     if ocr_text:
         return ocr_text, "ocr"
     return None, "none"
