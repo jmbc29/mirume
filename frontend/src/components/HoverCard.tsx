@@ -37,10 +37,13 @@ function persistSet(key: string, value: Set<string>): void {
 const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
 // Kept in sync with the "card" window's declared size in tauri.conf.json
-// (356x396 = these + 16px of room for the box-shadow to not get clipped).
+// (380x500 = these + 40px: 20px click-through padding on every side, see
+// the root wrapper's `padding` below).
 const CARD_MAX_WIDTH = 340;
-const CARD_MAX_HEIGHT = 380;
-const MAX_WORDS_SHOWN = 3;
+const CARD_MAX_HEIGHT = 460;
+// The word list scrolls past this height instead of growing the card
+// unboundedly when a capture region segments into many words.
+const WORD_LIST_MAX_HEIGHT = 240;
 
 const JLPT_COLORS: Record<string, string> = {
   N5: "#22c55e",
@@ -177,12 +180,10 @@ function WordRow({
   );
 }
 
-/** Top N content words, rarest (N1) first, easiest (N5) last, unknown last. */
-function pickTopWords(tokens: TokenOut[]): TokenOut[] {
+/** All content words, rarest (N1) first, easiest (N5) last, unknown last. */
+function sortContentWords(tokens: TokenOut[]): TokenOut[] {
   const contentWords = tokens.filter((t) => t.is_content_word);
-  return [...contentWords]
-    .sort((a, b) => (a.jlpt_level ?? 6) - (b.jlpt_level ?? 6))
-    .slice(0, MAX_WORDS_SHOWN);
+  return [...contentWords].sort((a, b) => (a.jlpt_level ?? 6) - (b.jlpt_level ?? 6));
 }
 
 function EnglishTranslationEntry({
@@ -385,18 +386,27 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
 
   if (!displayData || !lockedPosition) return null;
 
-  const topWords = pickTopWords(displayData.tokens);
-  const totalContentWords = displayData.tokens.filter((t) => t.is_content_word).length;
-  const hiddenCount = Math.max(0, totalContentWords - topWords.length);
+  const contentWords = sortContentWords(displayData.tokens);
 
   const saveAll = () => {
-    for (const t of topWords) {
+    for (const t of contentWords) {
       void saveWord(t, displayData.text);
     }
   };
 
   return (
-    <div style={{ position: "fixed", left: 0, top: 0, pointerEvents: "none" }}>
+    <div
+      style={{
+        position: "fixed",
+        left: 0,
+        top: 0,
+        width: "100vw",
+        height: "100vh",
+        padding: 20,
+        boxSizing: "border-box",
+        pointerEvents: "none",
+      }}
+    >
       <div
         style={{
           maxWidth: CARD_MAX_WIDTH,
@@ -426,11 +436,14 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
                 margin: "10px 0",
               }}
             />
-            <div>
-              {topWords.map((t, i) => (
+            <div
+              className="mirume-scroll"
+              style={{ maxHeight: WORD_LIST_MAX_HEIGHT, overflowY: "auto" }}
+            >
+              {contentWords.map((t, i) => (
                 <WordRow
                   token={t}
-                  showBorder={i < topWords.length - 1}
+                  showBorder={i < contentWords.length - 1}
                   saved={savedWords.has(t.surface)}
                   onSave={() => void saveWord(t, displayData.text)}
                   key={`word-${i}`}
@@ -446,12 +459,11 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
               }}
             >
               <span style={{ fontSize: 11, color: "#94a3b8" }}>
-                {totalContentWords} word{totalContentWords === 1 ? "" : "s"} total
-                {hiddenCount > 0 ? ` · ${hiddenCount} more` : ""}
+                {contentWords.length} word{contentWords.length === 1 ? "" : "s"} total
               </span>
               <SaveButton
                 onClick={saveAll}
-                label={`Save all ${topWords.length} word${topWords.length === 1 ? "" : "s"}`}
+                label={`Save all ${contentWords.length} word${contentWords.length === 1 ? "" : "s"}`}
               />
             </div>
           </>

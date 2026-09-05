@@ -7,8 +7,10 @@ the cursor and running `PaddleOCR <https://github.com/PaddlePaddle/PaddleOCR>`_
 over it. PaddleOCR runs as a two-stage pipeline — a detection model that finds
 each line of text's exact bounding box, then a recognition model that reads
 only the pixels inside each box — which is what this module is built around:
-of everything detected in the captured region, only the box closest to the
-cursor is returned. This replaced `manga-ocr <https://github.com/kha-white/manga-ocr>`_,
+of everything detected in the captured region, only the single box closest to
+the cursor is returned (never more than one — see :data:`_OCR_MAX_BOX_DISTANCE_PX`
+for the cutoff that keeps a cursor sitting between two blocks from matching
+whichever is barely nearer). This replaced `manga-ocr <https://github.com/kha-white/manga-ocr>`_,
 which read the captured region as a single blob of text and would blend
 together unrelated nearby UI elements on a dense page (its output looked like
 a hallucination but was really just several fragments run together).
@@ -121,7 +123,21 @@ _capture_warned = False
 _MIN_CONTRAST_RANGE = 70
 
 #: Minimum recognition confidence (0-1) for a detected line to be trusted.
-_MIN_OCR_CONFIDENCE = 0.5
+#: Raised from 0.5 back to 0.7 — a lower bar let more low-quality detections
+#: through, including boxes where the detector had merged two adjacent
+#: pieces of text (e.g. a word and its furigana reading) into one box that
+#: the recognizer then read as a single garbled string.
+_MIN_OCR_CONFIDENCE = 0.7
+
+#: Maximum distance (px, in the *captured image's* coordinate space — the
+#: cursor always sits at the image centre, see :func:`_run_ocr_pass`) a
+#: detected box's centre may be from the cursor to still count as "the line
+#: under the cursor". Without this, the closest box was returned no matter
+#: how far away it actually was, so a cursor sitting in the whitespace
+#: between two unrelated text blocks would still match whichever was
+#: (barely) nearer — which looked like text from the wrong block, or two
+#: blocks' text blended together when the cursor moved between them.
+_OCR_MAX_BOX_DISTANCE_PX = 80
 
 #: Vertical shift (screen points) applied to the capture region on a retry
 #: pass — see :func:`extract_text_at_position`. Catches text that sat right
@@ -154,6 +170,7 @@ _OCR_BLOCKED_APPS: frozenset[str] = frozenset(
 _BLOCKED_DOMAINS: frozenset[str] = frozenset(
     {
         "claude.ai",
+        "claude.com",
         "chat.openai.com",
         "chatgpt.com",
         "localhost",
@@ -402,8 +419,15 @@ def get_chrome_url() -> str:
             text=True,
             timeout=1,
         )
-        return result.stdout.strip().lower()
-    except Exception:
+        url = result.stdout.strip().lower()
+        if not url:
+            print(
+                f"[mirume] get_chrome_url: empty result "
+                f"(stderr: {result.stderr.strip()!r})"
+            )
+        return url
+    except Exception as exc:
+        print(f"[mirume] get_chrome_url failed: {exc}")
         return ""
 
 
@@ -450,9 +474,11 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
 
     Returns:
         The recognised text of the closest line, stripped, or ``None`` when
-        nothing was captured, the region is too low-contrast to hold text, or
-        no detected line clears both :data:`_MIN_OCR_CONFIDENCE` and having
-        at least one Japanese character.
+        nothing was captured, the region is too low-contrast to hold text, no
+        detected line clears both :data:`_MIN_OCR_CONFIDENCE` and having at
+        least one Japanese character, or the closest qualifying line is
+        farther than :data:`_OCR_MAX_BOX_DISTANCE_PX` from the cursor (it's
+        whitespace between blocks, not a line the cursor is actually on).
     """
     left = x - _OCR_REGION_WIDTH / 2
     top = y - _OCR_REGION_HEIGHT / 2
@@ -494,6 +520,8 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
             best_text = text
 
     if best_text is None:
+        return None
+    if best_distance > _OCR_MAX_BOX_DISTANCE_PX:
         return None
     text = best_text.strip()
     if len(text) < 2:
@@ -605,11 +633,18 @@ def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TI
         low-contrast to hold text, or no detected line clears both
         :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese
         character.
-    """
-    cache_key = _ocr_cache_key(x, y)
-    if cache_key in _ocr_result_cache:
-        return _ocr_result_cache[cache_key]
 
+    Gating (frontmost app / Chrome URL) runs *before* the cache lookup, not
+    after. It used to run after, which meant a hover that landed on an
+    already-cached screen position skipped gating entirely — so switching
+    from an allowed app/tab to a blocked one (e.g. an NHK Chrome tab to a
+    claude.ai tab) without moving the cursor would still return the
+    *previous* tab's cached text for that same screen coordinate, since the
+    cache was consulted first and gating never got a chance to say no.
+    ``get_frontmost_app()`` costs ~10-50 ms, trivial next to the OCR pass a
+    cache hit exists to save, so paying it on every call (not just cache
+    misses) is a small, worthwhile price for correctness.
+    """
     if _get_model() is None:
         return None
 
@@ -617,16 +652,28 @@ def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TI
     # this backend's own terminal are never a valid OCR target (VS Code text
     # the AX tree misses still isn't web content).
     frontmost = get_frontmost_app()
-    if frontmost in _OCR_BLOCKED_APPS:
-        return None
+    blocked = frontmost in _OCR_BLOCKED_APPS
 
     # The app-level check above sees "Google Chrome" for every website, so
     # AI chat sites need a second, URL-based gate — otherwise Mirume reads
     # Claude's own Japanese-language replies as text to classify.
-    if frontmost == "Google Chrome":
+    if not blocked and frontmost == "Google Chrome":
         url = get_chrome_url()
-        if any(blocked in url for blocked in _BLOCKED_DOMAINS):
-            return None
+        blocked = any(domain in url for domain in _BLOCKED_DOMAINS)
+
+    if blocked:
+        # Drop anything still queued for the worker too — it was enqueued
+        # for a screen position that's no longer valid to OCR (the app/tab
+        # changed since), so there's no point letting it run.
+        try:
+            _ocr_request_queue.get_nowait()
+        except queue.Empty:
+            pass
+        return None
+
+    cache_key = _ocr_cache_key(x, y)
+    if cache_key in _ocr_result_cache:
+        return _ocr_result_cache[cache_key]
 
     start_ocr_worker()
 

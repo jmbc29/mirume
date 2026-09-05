@@ -12,9 +12,10 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 /// same window to the card's rect on every hover was visually misaligned
 /// with the card's rendered content ("show_card_window"/"hide_card_window",
 /// now removed). A dedicated pre-sized window has neither problem: showing
-/// it just moves it, so the window frame and the card's content — which
-/// fills the window edge to edge — line up exactly, and `"main"` never
-/// changes state at all.
+/// it just moves it, so the window frame and the card's content — inset by
+/// a fixed 20px margin on every side (see HoverCard.tsx), generous enough
+/// that a click at the card's visual edge can never land outside the
+/// window — line up exactly, and `"main"` never changes state at all.
 ///
 /// `(x, y)` are logical points and are clamped so the card window never ends
 /// up positioned off the primary monitor (using `"main"`'s size, which is
@@ -137,11 +138,15 @@ pub fn run() {
             configure_overlay_window(&main)?;
 
             // The card window is declared in tauri.conf.json (label "card",
-            // fixed 356x396 size, hidden) and created eagerly alongside
-            // "main" — it just needs the same above-fullscreen treatment and
-            // to start click-through, matching "main"'s permanent state.
-            // show_card/hide_card are the only things that ever touch it
-            // again after this.
+            // fixed 380x500 size — 340x460 of card content plus 20px of
+            // click-through-safety padding on every side, see HoverCard.tsx
+            // — hidden, resizable in case the user wants more room) and
+            // created eagerly alongside "main". It just needs the same
+            // above-fullscreen treatment and to start click-through,
+            // matching "main"'s permanent state. show_card/hide_card only
+            // ever move/show or hide it — never resize it, deliberately:
+            // resizing on every hover was the previous design's source of
+            // the misalignment bug show_card/hide_card replaced.
             if let Some(card) = app.get_webview_window("card") {
                 configure_overlay_window(&card)?;
             }
