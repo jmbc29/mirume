@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hasRenderableContent } from "../lib/hoverContent";
 import type { GrammarPattern, HoverResponse, TokenOut, TranslationOut } from "../types/hover";
 import type { CursorPosition } from "../hooks/useMouseTracker";
 
@@ -41,9 +42,6 @@ const CURSOR_OFFSET = 20;
 // the root wrapper's `padding` below).
 const CARD_MAX_WIDTH = 340;
 const CARD_MAX_HEIGHT = 460;
-// The word list scrolls past this height instead of growing the card
-// unboundedly when a capture region segments into many words.
-const WORD_LIST_MAX_HEIGHT = 240;
 
 const JLPT_COLORS: Record<string, string> = {
   N5: "#22c55e",
@@ -269,25 +267,6 @@ interface HoverCardProps {
   triggerPoint: CursorPosition;
 }
 
-/**
- * Whether the backend response is worth showing a card for.
- *
- * The card must stay hidden unless the cursor is actually over meaningful
- * Japanese text or a translation. It is hidden when:
- *   - there is no data, OR
- *   - there are no content-word tokens AND no translations, OR
- *   - (for the token path) no token carries a real JLPT level.
- */
-function hasRenderableContent(d: HoverResponse | null): boolean {
-  if (!d) return false;
-  const contentWords = d.tokens.filter((t) => t.is_content_word);
-  if (contentWords.length === 0 && d.translations.length === 0) return false;
-  if (d.translations.length === 0 && !d.tokens.some((t) => t.jlpt_level !== null)) {
-    return false;
-  }
-  return true;
-}
-
 export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   const [visible, setVisible] = useState(false);
   const [displayData, setDisplayData] = useState<HoverResponse | null>(null);
@@ -409,6 +388,8 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
     >
       <div
         style={{
+          display: "flex",
+          flexDirection: "column",
           maxWidth: CARD_MAX_WIDTH,
           maxHeight: CARD_MAX_HEIGHT,
           overflow: "hidden",
@@ -428,17 +409,24 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
       >
         {displayData.tokens.length > 0 && (
           <>
-            <SentenceDisplay tokens={displayData.tokens} />
+            <div style={{ flexShrink: 0 }}>
+              <SentenceDisplay tokens={displayData.tokens} />
+            </div>
             <div
               style={{
+                flexShrink: 0,
                 height: 1,
                 backgroundColor: "rgba(255,255,255,0.08)",
                 margin: "10px 0",
               }}
             />
+            {/* flex:1 + min-height:0 (not a fixed max-height guess) is what
+                makes this reliably take "whatever's left" under the card's
+                own maxHeight and scroll the rest, regardless of how many
+                lines the sentence above wraps to. */}
             <div
               className="mirume-scroll"
-              style={{ maxHeight: WORD_LIST_MAX_HEIGHT, overflowY: "auto" }}
+              style={{ flex: "1 1 auto", minHeight: 0, overflowY: "scroll" }}
             >
               {contentWords.map((t, i) => (
                 <WordRow
@@ -452,6 +440,7 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
             </div>
             <div
               style={{
+                flexShrink: 0,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",

@@ -231,3 +231,11 @@ models/*
 
 # Backend virtual environment
 backend/venv/
+
+# The Python-packaging `lib/` rule near the top of this file (standard
+# Python boilerplate, meant for a build-generated lib/ dir) is unanchored,
+# so it also unintentionally matches frontend/src/lib/ — real, hand-written
+# frontend source (shared helpers used by multiple components), not a
+# build artifact. Un-ignore it explicitly.
+!/frontend/src/lib/
+!/frontend/src/lib/**

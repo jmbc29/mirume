@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hasRenderableContent } from "../lib/hoverContent";
 import type { HoverResponse } from "../types/hover";
 
 const HOVER_ENDPOINT = "http://127.0.0.1:8123/hover";
@@ -26,14 +27,15 @@ const HOVER_RETRY_MS = 300;
  */
 const MAX_DRIFT_PX = 300;
 /**
- * Once a card has been showing for less than this long, an empty /hover
- * response is ignored instead of clearing it. Without this, reaching for the
- * Save button re-triggers the debounced /hover cycle at the cursor's new
- * position (now over the card's own window, not the original text), which
- * comes back empty and would otherwise wipe the card out from under the
- * cursor before the click lands.
+ * Once a card has been showing for less than this long, a non-renderable
+ * /hover response is ignored instead of clearing it. Without this, reaching
+ * for the Save button re-triggers the debounced /hover cycle at the
+ * cursor's new position (now over the card's own window, not the original
+ * text), which comes back empty and would otherwise wipe the card out from
+ * under the cursor before the click lands. A full 3 seconds — comfortably
+ * longer than it takes to move the cursor from the trigger point to Save.
  */
-const MIN_DISPLAY_MS = 2000;
+const MIN_DISPLAY_MS = 3000;
 
 interface MouseTrackerState {
   data: HoverResponse | null;
@@ -115,8 +117,7 @@ export function useMouseTracker(): MouseTrackerState & {
         if (requestId !== requestIdRef.current || cancelled) {
           return;
         }
-        const hasContent = json.tokens.length > 0 || json.translations.length > 0;
-        if (!hasContent) {
+        if (!hasRenderableContent(json)) {
           if (!isRetry) {
             // OCR can miss a line on a single pass — give it one more try
             // at the same spot before actually hiding the card.
@@ -129,15 +130,18 @@ export function useMouseTracker(): MouseTrackerState & {
           }
           const shownMs = cardShownAtRef.current ? Date.now() - cardShownAtRef.current : Infinity;
           if (shownMs < MIN_DISPLAY_MS) {
-            // The card only just appeared — this empty response is almost
-            // certainly from a /hover fired at the cursor's current spot
-            // (e.g. now over the card itself), not evidence the original
-            // text is gone. Keep showing the existing data.
+            // The card only just appeared — this non-renderable response is
+            // almost certainly from a /hover fired at the cursor's current
+            // spot (e.g. now over the card itself), not evidence the
+            // original text is gone. Keep showing the existing data.
             setState((prev) => ({ ...prev, loading: false, error: null }));
             return;
           }
-          // Backend found no real screen text — this is the only case that
-          // clears the card once shown; a drifting cursor alone never does.
+          // Backend found nothing worth showing — this is the only case
+          // that clears the card once shown; a drifting cursor alone never
+          // does, regardless of grace period (see the drift-handling block
+          // below, which only ever resets a stale reference point, never
+          // clears displayed data).
           setState({ data: null, loading: false, error: null });
           return;
         }

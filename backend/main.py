@@ -50,7 +50,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import threading
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator
@@ -141,25 +140,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "https://www.deepl.com/pro-api).\n"
         )
 
-    # Start the persistent OCR worker thread and warm up its model: loading
-    # PaddleOCR takes several seconds (longer still on a cold weights-download
-    # cache), so kick it off now rather than on the first Chrome hover. Runs
-    # on a daemon thread so a slow/absent network never blocks startup; the
-    # (0, 0) capture yields no Japanese and is discarded — we only want the
-    # worker's model resident in memory. The warmup call gets a generous
-    # timeout since, unlike a real hover, it's the one call that has to
-    # actually wait out the model load rather than give up quickly.
-    def _warm_ocr() -> None:
-        try:
-            from ocr import extract_text_at_position, start_ocr_worker
+    # Start the persistent OCR worker thread. It loads PaddleOCR's weights
+    # and runs its own throwaway inference pass to pay first-call JIT/kernel
+    # costs upfront too (see ocr._warm_up_inference) — both happen on the
+    # worker's own thread, entirely bypassing gating, so startup's frontmost
+    # app (almost always this backend's own launching terminal, a blocked
+    # dev tool) can never cut the warmup short the way it used to when this
+    # called extract_text_at_position(0, 0) directly. start_ocr_worker()
+    # itself only spawns that thread and returns immediately, so it's safe
+    # to call inline here rather than wrapping it in another thread.
+    try:
+        from ocr import start_ocr_worker
 
-            start_ocr_worker()
-            extract_text_at_position(0, 0, timeout=30)
-        except Exception as exc:  # pragma: no cover - model/deps optional
-            print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
-                  "slow on first use or unavailable.")
-
-    threading.Thread(target=_warm_ocr, name="ocr-warmup", daemon=True).start()
+        start_ocr_worker()
+    except Exception as exc:  # pragma: no cover - model/deps optional
+        print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
+              "slow on first use or unavailable.")
 
     yield
 

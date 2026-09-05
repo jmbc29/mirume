@@ -26,7 +26,12 @@ body,
 }
 
 /* Hover card's word list — scrolls instead of growing the card unboundedly
-   when a capture segments into many words (see HoverCard.tsx). */
+   when a capture segments into many words (see HoverCard.tsx). Belt and
+   braces alongside the inline `overflowY: "scroll"` there. */
+.mirume-scroll {
+  overflow-y: scroll !important;
+}
+
 .mirume-scroll::-webkit-scrollbar {
   width: 4px;
 }

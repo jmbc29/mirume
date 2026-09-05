@@ -144,6 +144,15 @@ _OCR_MAX_BOX_DISTANCE_PX = 80
 #: at the edge of (and so was clipped or missed by) the first pass's region.
 _OCR_RETRY_Y_SHIFT = 30
 
+#: Matches a short (<=6 char) unit immediately repeated 3+ times in a row —
+#: a known PaddleOCR recognition failure on an ambiguous/small crop, where
+#: the decoder gets stuck reproducing the same span (e.g. a box that should
+#: read "鹿児島" comes back "鹿児島鹿児島鹿児島鹿児島"). Requires *3 or more*
+#: repeats, not 2, so legitimate Japanese reduplication is never touched —
+#: words like 色々, 我々, 時々 and onomatopoeia like わくわく double, they
+#: don't triple.
+_REPEATED_UNIT_RE = re.compile(r"(.{1,6}?)\1{2,}")
+
 #: App process names (as reported by System Events, i.e. what
 #: :func:`get_frontmost_app` returns) where OCR should never run: dev tools
 #: and terminals the user is likely to have Mirume's own backend open in, plus
@@ -165,14 +174,18 @@ _OCR_BLOCKED_APPS: frozenset[str] = frozenset(
 
 #: Substrings matched against the active Chrome tab's URL (lowercased) to
 #: block OCR on — AI chat sites where Mirume would otherwise treat the
-#: assistant's Japanese-language replies as text to classify, plus localhost,
-#: which is almost always this project's own dev servers.
+#: assistant's Japanese-language replies as text to classify; GitHub, where
+#: this project's own README (which has Japanese text in it) would otherwise
+#: get read while browsing the repo; and localhost, almost always this
+#: project's own dev servers.
 _BLOCKED_DOMAINS: frozenset[str] = frozenset(
     {
         "claude.ai",
         "claude.com",
         "chat.openai.com",
         "chatgpt.com",
+        "github.com",
+        "github.io",
         "localhost",
         "127.0.0.1",
     }
@@ -458,6 +471,20 @@ def _has_text_contrast(image: "Image.Image") -> bool:
     return (hi - lo) >= _MIN_CONTRAST_RANGE
 
 
+def _collapse_repeated_text(text: str) -> str:
+    """Collapse a run of the same short unit repeated 3+ times to one copy.
+
+    See :data:`_REPEATED_UNIT_RE`. PaddleOCR's recognizer occasionally gets
+    stuck on an ambiguous or small crop and reproduces the same short span
+    several times in a row instead of emitting an end token — this is a
+    single detected box misbehaving, not multiple boxes being combined
+    (:func:`_run_ocr_pass` only ever returns one box's text to begin with).
+    Applied to the winning box's text before it's returned, so a garbled
+    "鹿児島鹿児島鹿児島鹿児島" becomes "鹿児島" instead of being shown as-is.
+    """
+    return _REPEATED_UNIT_RE.sub(r"\1", text)
+
+
 def _run_ocr_pass(model, x: float, y: float) -> str | None:
     """Capture + recognise a single :data:`_OCR_REGION_WIDTH` x
     :data:`_OCR_REGION_HEIGHT` region centred on ``(x, y)``.
@@ -523,7 +550,7 @@ def _run_ocr_pass(model, x: float, y: float) -> str | None:
         return None
     if best_distance > _OCR_MAX_BOX_DISTANCE_PX:
         return None
-    text = best_text.strip()
+    text = _collapse_repeated_text(best_text.strip())
     if len(text) < 2:
         return None
     return text
@@ -542,17 +569,43 @@ def _ocr_cache_key(x: float, y: float) -> tuple[int, int]:
     )
 
 
+def _warm_up_inference(model) -> None:
+    """Run one throwaway inference pass before the worker starts serving requests.
+
+    Measured directly (2026-09): a fresh ``model.predict()`` call on a
+    600x300 image (the real capture size) costs ~0.5s whether or not an
+    earlier call already ran one — there's no separate "first-call is much
+    slower" tax to amortize in this setup, so this isn't what was behind a
+    multi-second stall (see :func:`extract_text_at_position`'s
+    ``_ocr_instance`` check for the actual fix for that). Kept anyway as a
+    cheap, harmless sanity check that the loaded model can really run
+    inference before the worker advertises itself as ready — and the old
+    version of this warmup call (through :func:`extract_text_at_position`,
+    with frontmost-app gating still active) would return at the gate before
+    ever reaching ``model.predict()`` at all, since the backend's own
+    launching terminal is almost always frontmost at startup. This bypasses
+    all gating by construction: called directly on a blank image, never
+    through :func:`extract_text_at_position`.
+    """
+    try:
+        blank = np.zeros((100, 300, 3), dtype=np.uint8)
+        model.predict(blank)
+    except Exception as exc:  # pragma: no cover - warmup is best-effort
+        print(f"[mirume] OCR inference warmup failed ({exc}); first real hover may be slow.")
+
+
 def _ocr_worker() -> None:
     """Background thread owning the PaddleOCR model and every inference call.
 
-    Loads the model once (blocking this thread only — real requests just wait
-    on it, see :func:`extract_text_at_position`), then loops pulling
-    ``(x, y, result_event)`` off :data:`_ocr_request_queue` forever. For each:
-    checks :data:`_ocr_result_cache` first; otherwise runs :func:`_run_ocr_pass`
-    at ``(x, y)`` and, if that misses, once more with the region shifted up by
-    :data:`_OCR_RETRY_Y_SHIFT` px (catches a line clipped at the first pass's
-    edge) — then caches and stores the result on ``result_event`` before
-    setting it, waking whichever request thread is waiting.
+    Loads the model once and runs one warmup inference (blocking this thread
+    only — real requests just wait on it, see :func:`extract_text_at_position`),
+    then loops pulling ``(x, y, result_event)`` off :data:`_ocr_request_queue`
+    forever. For each: checks :data:`_ocr_result_cache` first; otherwise runs
+    :func:`_run_ocr_pass` at ``(x, y)`` and, if that misses, once more with
+    the region shifted up by :data:`_OCR_RETRY_Y_SHIFT` px (catches a line
+    clipped at the first pass's edge) — then caches and stores the result on
+    ``result_event`` before setting it, waking whichever request thread is
+    waiting.
 
     Being the sole caller of :func:`_run_ocr_pass`, this thread is also what
     makes that function's capture+inference lock-free and safe: only one
@@ -562,6 +615,8 @@ def _ocr_worker() -> None:
     :func:`start_ocr_worker`.
     """
     model = _get_model()
+    if model is not None:
+        _warm_up_inference(model)
     while True:
         try:
             x, y, result_event = _ocr_request_queue.get(timeout=1)
@@ -644,8 +699,18 @@ def extract_text_at_position(x: float, y: float, timeout: float = _OCR_WORKER_TI
     ``get_frontmost_app()`` costs ~10-50 ms, trivial next to the OCR pass a
     cache hit exists to save, so paying it on every call (not just cache
     misses) is a small, worthwhile price for correctness.
+
+    Checks ``_ocr_instance`` directly rather than calling :func:`_get_model`
+    here — :func:`_get_model` blocks on ``_model_lock`` with no timeout
+    while the model loads (several seconds, longer on a cold weights-
+    download), and a hover landing during that window would otherwise
+    block this whole request for however much of the load remains. The
+    worker thread (see :func:`_ocr_worker`) is the one place that should
+    ever pay that cost; every other caller just treats "not loaded yet" the
+    same as "not available" and returns fast — the next hover, once loading
+    finishes, proceeds normally.
     """
-    if _get_model() is None:
+    if _ocr_instance is None:
         return None
 
     # Gated on the frontmost app, not just cursor position: dev tools and
