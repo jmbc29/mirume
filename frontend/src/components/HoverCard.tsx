@@ -347,7 +347,14 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
     setLockedPosition(triggerPoint);
     setVisible(true);
     window.clearTimeout(hideTimeoutRef.current);
-    hideTimeoutRef.current = window.setTimeout(() => setVisible(false), AUTO_HIDE_MS);
+    hideTimeoutRef.current = window.setTimeout(() => {
+      setVisible(false);
+      // Release the card window too — a faded-out card that still owns clicks
+      // would keep eating them over whatever is now underneath it.
+      void invoke("hide_card").catch(() => {
+        // Not running inside Tauri (e.g. plain browser dev) — ignore.
+      });
+    }, AUTO_HIDE_MS);
     // Move the card's own (fixed-size, otherwise-hidden) window to the
     // trigger point and make it capture clicks, so Save actually receives
     // them instead of passing them through to the app underneath.

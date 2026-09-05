@@ -81,6 +81,17 @@ _MAX_CHILDREN_PER_LEVEL = 30
 #: Stop concatenating child text once this many characters have been collected.
 _MAX_TEXT_CHARS = 4000
 
+#: An element whose own text — or whose descendants' text once joined — is
+#: longer than this is a page-level container, not the specific word or line
+#: under the cursor, so its text is discarded rather than returned. macOS
+#: hit-testing on a web page (Chrome especially) resolves a large fraction of
+#: points not to the tiny ``AXStaticText`` under them but to a viewport-sized
+#: ``AXGroup`` whose descendants' text, naively joined, is the entire page —
+#: which is what made the hover card show every headline at once. When this
+#: fires ``get_text_at_position`` returns ``None`` and ``/hover`` falls back to
+#: the OCR path, which reads only the line beneath the cursor.
+_MAX_ELEMENT_TEXT_CHARS = 200
+
 PERMISSION_INSTRUCTIONS = (
     "Mirume needs macOS Accessibility permission to read on-screen text.\n"
     "  1. Open System Settings ▸ Privacy & Security ▸ Accessibility\n"
@@ -198,12 +209,20 @@ def _extract_text(element: object | None, depth: int = _MAX_DESCEND_DEPTH) -> st
     container the immediate children are visited up to ``depth`` levels and
     their text joined.
 
+    An element whose text (direct, or its children's combined) runs longer than
+    :data:`_MAX_ELEMENT_TEXT_CHARS` is treated as a container that has
+    coalesced everything below it rather than the one thing under the cursor:
+    its direct text is skipped in favour of descending for something more
+    specific, and an over-long *combined* result is dropped entirely (returns
+    ``None``) so the caller can fall back to OCR.
+
     Args:
         element: An ``AXUIElementRef`` or ``None``.
         depth: Remaining levels of child descent allowed.
 
     Returns:
-        The extracted text, or ``None`` if nothing textual was found.
+        The extracted text (always :data:`_MAX_ELEMENT_TEXT_CHARS` characters or
+        fewer), or ``None`` if nothing specific enough was found.
     """
     if element is None:
         return None
@@ -211,8 +230,10 @@ def _extract_text(element: object | None, depth: int = _MAX_DESCEND_DEPTH) -> st
     direct = _direct_text(element)
     if direct:
         cleaned = _clean(direct)
-        if cleaned:
+        if cleaned and len(cleaned) <= _MAX_ELEMENT_TEXT_CHARS:
             return cleaned
+        # Longer than a sentence or two: this element's own text is really a
+        # whole container's worth. Fall through and try to localise to a child.
 
     if depth <= 0:
         return None
@@ -232,7 +253,11 @@ def _extract_text(element: object | None, depth: int = _MAX_DESCEND_DEPTH) -> st
                 break
 
     combined = _clean(" ".join(_dedupe_nested_text(parts)))
-    return combined or None
+    if combined and len(combined) <= _MAX_ELEMENT_TEXT_CHARS:
+        return combined
+    # Either nothing textual below, or the descent still only produced a
+    # page-sized blob — either way there is no single element here to report.
+    return None
 
 
 def _dedupe_nested_text(parts: list[str]) -> list[str]:

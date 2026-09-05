@@ -33,7 +33,8 @@
         "decorations": false,
         "resizable": true,
         "shadow": false,
-        "visible": false
+        "visible": false,
+        "acceptFirstMouse": true
       }
     ],
     "macOSPrivateApi": true,

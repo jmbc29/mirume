@@ -36,6 +36,39 @@ const MAX_DRIFT_PX = 300;
  * longer than it takes to move the cursor from the trigger point to Save.
  */
 const MIN_DISPLAY_MS = 3000;
+/**
+ * A shown card is re-checked at least this often even while the cursor sits
+ * perfectly still. The context under it can change with no mouse movement at
+ * all — switching browser tab by keyboard, scrolling the page, an app switch —
+ * and a card left over from the previous context should not linger. The
+ * re-check goes through the same /hover call, so a now-blocked surface
+ * (claude.ai, another app) comes back empty and the card hides.
+ */
+const REVALIDATE_MS = 2000;
+/**
+ * Footprint of the card's own window — its {@link CARD_REGION_OFFSET} from the
+ * trigger point plus its declared size in tauri.conf.json — padded by
+ * {@link CARD_REGION_SLACK}. An empty /hover fired while the cursor is inside
+ * this box is read as "the cursor is now over the card" (the user reaching for
+ * Save) and is subject to the MIN_DISPLAY_MS grace; one fired outside it means
+ * the context is genuinely gone and clears the card straight away.
+ */
+const CARD_REGION_OFFSET = 20;
+const CARD_REGION_WIDTH = 380;
+const CARD_REGION_HEIGHT = 500;
+const CARD_REGION_SLACK = 40;
+
+function cursorOverCard(pos: CursorPosition, cardTrigger: CursorPosition | null): boolean {
+  if (!cardTrigger) return false;
+  const left = cardTrigger.x + CARD_REGION_OFFSET - CARD_REGION_SLACK;
+  const top = cardTrigger.y + CARD_REGION_OFFSET - CARD_REGION_SLACK;
+  return (
+    pos.x >= left &&
+    pos.x <= left + CARD_REGION_WIDTH + 2 * CARD_REGION_SLACK &&
+    pos.y >= top &&
+    pos.y <= top + CARD_REGION_HEIGHT + 2 * CARD_REGION_SLACK
+  );
+}
 
 interface MouseTrackerState {
   data: HoverResponse | null;
@@ -90,6 +123,13 @@ export function useMouseTracker(): MouseTrackerState & {
   const requestIdRef = useRef(0);
   // When content last appeared — used to enforce MIN_DISPLAY_MS below.
   const cardShownAtRef = useRef<number | null>(null);
+  // Trigger point of the card currently on screen, or null when none is shown.
+  // Lets an "empty because the cursor moved onto the card" response be told
+  // apart from an "empty because the context is gone" one, and lets the poll
+  // loop know a card is up so it can re-validate it while the cursor is still.
+  const displayedTriggerRef = useRef<CursorPosition | null>(null);
+  // When a (non-retry) /hover call last went out — rate-limits REVALIDATE_MS.
+  const lastHoverAtRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -97,6 +137,7 @@ export function useMouseTracker(): MouseTrackerState & {
     const fireHover = async (position: CursorPosition, isRetry = false) => {
       if (!isRetry) {
         lastCalledRef.current = position;
+        lastHoverAtRef.current = Date.now();
       }
 
       // A retry re-queries the same logical request rather than starting a
@@ -129,23 +170,29 @@ export function useMouseTracker(): MouseTrackerState & {
             return;
           }
           const shownMs = cardShownAtRef.current ? Date.now() - cardShownAtRef.current : Infinity;
-          if (shownMs < MIN_DISPLAY_MS) {
-            // The card only just appeared — this non-renderable response is
-            // almost certainly from a /hover fired at the cursor's current
-            // spot (e.g. now over the card itself), not evidence the
-            // original text is gone. Keep showing the existing data.
+          if (shownMs < MIN_DISPLAY_MS && cursorOverCard(position, displayedTriggerRef.current)) {
+            // The card only just appeared and the cursor is now over it — this
+            // non-renderable response is almost certainly from a /hover fired
+            // at the cursor's current spot (e.g. reaching for Save), not
+            // evidence the original text is gone. Keep showing the existing
+            // data. An empty response from anywhere *else* (the cursor moved
+            // off to blank space, the tab/app changed under a still cursor)
+            // falls through and clears the card.
             setState((prev) => ({ ...prev, loading: false, error: null }));
             return;
           }
-          // Backend found nothing worth showing — this is the only case
-          // that clears the card once shown; a drifting cursor alone never
-          // does, regardless of grace period (see the drift-handling block
-          // below, which only ever resets a stale reference point, never
-          // clears displayed data).
+          // Backend found nothing worth showing and the cursor isn't on the
+          // card: the context under it is genuinely gone (text scrolled away,
+          // switched to claude.ai or another blocked surface, app switch).
+          // A drifting cursor alone still never clears the card — only an
+          // actual empty /hover response does (see the drift-handling block
+          // below, which only ever resets a stale reference point).
+          displayedTriggerRef.current = null;
           setState({ data: null, loading: false, error: null });
           return;
         }
         cardShownAtRef.current = Date.now();
+        displayedTriggerRef.current = position;
         setTriggerPoint(position);
         setState({ data: json, loading: false, error: null });
       } catch (err) {
@@ -179,7 +226,16 @@ export function useMouseTracker(): MouseTrackerState & {
           Math.hypot(position.x - lastSample.x, position.y - lastSample.y) > MIN_MOVE_PX;
         if (!moved) {
           // Cursor is holding steady — leave any in-flight still-timer
-          // running rather than restarting it on every sample.
+          // running rather than restarting it on every sample. But if a card
+          // is showing, re-fire /hover at the same spot every REVALIDATE_MS so
+          // a context change that produced no mouse movement (keyboard tab
+          // switch, page scroll, app switch) still tears a now-stale card down.
+          if (
+            displayedTriggerRef.current &&
+            Date.now() - lastHoverAtRef.current > REVALIDATE_MS
+          ) {
+            void fireHover(position);
+          }
           return;
         }
         lastSampleRef.current = position;

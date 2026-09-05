@@ -20,6 +20,13 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 /// `(x, y)` are logical points and are clamped so the card window never ends
 /// up positioned off the primary monitor (using `"main"`'s size, which is
 /// already stretched to match it — see `setup`).
+///
+/// The card is shown but deliberately *not* focused — yanking focus off
+/// whatever the user is reading every time a card pops up would be worse than
+/// the bug it fixes. For Save clicks to still land on the first click while
+/// Mirume is a background app, the card window sets `"acceptFirstMouse": true`
+/// (see `tauri.conf.json`); without it macOS swallows that first click as a
+/// window-activation click and the card auto-hides before a second one.
 #[tauri::command]
 fn show_card(app: tauri::AppHandle, x: f64, y: f64) -> Result<(), String> {
     let card = app.get_webview_window("card").ok_or("card window not found")?;
