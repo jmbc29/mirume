@@ -115,7 +115,12 @@ _capture_warned = False
 _MIN_CONTRAST_RANGE = 70
 
 #: Minimum recognition confidence (0-1) for a detected line to be trusted.
-_MIN_OCR_CONFIDENCE = 0.7
+_MIN_OCR_CONFIDENCE = 0.5
+
+#: Vertical shift (screen points) applied to the capture region on a retry
+#: pass — see :func:`extract_text_at_position`. Catches text that sat right
+#: at the edge of (and so was clipped or missed by) the first pass's region.
+_OCR_RETRY_Y_SHIFT = 30
 
 #: App process names (as reported by System Events, i.e. what
 #: :func:`get_frontmost_app` returns) where OCR should never run: dev tools
@@ -419,15 +424,87 @@ def _has_text_contrast(image: "Image.Image") -> bool:
     return (hi - lo) >= _MIN_CONTRAST_RANGE
 
 
-def extract_text_at_position(x: float, y: float) -> str | None:
-    """OCR a 400x200 region centred on ``(x, y)`` and return the line nearest the cursor.
+def _run_ocr_pass(model, x: float, y: float) -> str | None:
+    """Capture + recognise a single :data:`_OCR_REGION_WIDTH` x
+    :data:`_OCR_REGION_HEIGHT` region centred on ``(x, y)``.
 
-    PaddleOCR's detector finds every line of text in the captured region as a
-    separate bounding box; of those, only the one whose box centre is closest
-    to the cursor (the exact centre of the capture) is returned. This is what
-    keeps a dense page — several unrelated lines of text within 200px of the
-    cursor — from blending into one hallucinated string the way manga-ocr's
-    single whole-region pass did.
+    Of everything PaddleOCR's detector finds in that region, only the
+    recognised text of the box whose centre sits closest to ``(x, y)`` — the
+    exact centre of the capture — is returned. This is what keeps a dense
+    page — several unrelated lines of text within the capture region — from
+    blending into one hallucinated string the way manga-ocr's single
+    whole-region pass did.
+
+    Held for the duration of the call: a process-wide lock serialising
+    capture + inference — see :data:`_infer_lock`. If it can't be acquired
+    quickly this returns ``None`` rather than queue — the cursor has usually
+    moved on by the time a second concurrent call would finish.
+
+    Returns:
+        The recognised text of the closest line, stripped, or ``None`` when
+        nothing was captured, the region is too low-contrast to hold text, or
+        no detected line clears both :data:`_MIN_OCR_CONFIDENCE` and having
+        at least one Japanese character.
+    """
+    if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
+        return None
+    try:
+        left = x - _OCR_REGION_WIDTH / 2
+        top = y - _OCR_REGION_HEIGHT / 2
+        image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
+        if image is None or not _has_text_contrast(image):
+            return None
+        try:
+            results = model.predict(np.array(image))
+        except Exception:
+            return None
+    finally:
+        _infer_lock.release()
+
+    if not results:
+        return None
+    result = results[0]
+    texts = result.get("rec_texts") or []
+    scores = result.get("rec_scores") or []
+    boxes = result.get("rec_boxes")
+    if boxes is None or len(texts) == 0:
+        return None
+
+    # The capture region is centred on (x, y), so that point sits at the
+    # exact centre of the image regardless of its value — the closest
+    # detected line to that point is the one the user is actually pointing at.
+    cursor_in_image = (_OCR_REGION_WIDTH / 2, _OCR_REGION_HEIGHT / 2)
+    best_text: str | None = None
+    best_distance = float("inf")
+    for text, score, box in zip(texts, scores, boxes):
+        if score < _MIN_OCR_CONFIDENCE:
+            continue
+        if not _JAPANESE_RE.search(text):
+            continue
+        box_x1, box_y1, box_x2, box_y2 = (float(v) for v in box[:4])
+        box_center = ((box_x1 + box_x2) / 2, (box_y1 + box_y2) / 2)
+        distance = (
+            (box_center[0] - cursor_in_image[0]) ** 2 + (box_center[1] - cursor_in_image[1]) ** 2
+        ) ** 0.5
+        if distance < best_distance:
+            best_distance = distance
+            best_text = text
+
+    if best_text is None:
+        return None
+    text = best_text.strip()
+    if len(text) < 2:
+        return None
+    return text
+
+
+def extract_text_at_position(x: float, y: float) -> str | None:
+    """OCR the region around ``(x, y)`` and return the line nearest the cursor.
+
+    Runs :func:`_run_ocr_pass` at ``(x, y)``; if that misses, retries once
+    with the capture region shifted up by :data:`_OCR_RETRY_Y_SHIFT` px,
+    which catches a line that sat right at the edge of (and so was clipped or
+    missed by) the first pass's region.
 
     Args:
         x: Horizontal screen coordinate (top-left origin, points).
@@ -435,17 +512,14 @@ def extract_text_at_position(x: float, y: float) -> str | None:
 
     Returns:
         The recognised text of the closest line, stripped, or ``None`` when
-        nothing was captured, the model is unavailable or busy, the frontmost
-        app is a blocked dev tool (:data:`_OCR_BLOCKED_APPS`), Chrome's active
-        tab is a blocked AI chat site (:data:`_BLOCKED_DOMAINS`), the region
-        is too low-contrast to hold text, or no detected line clears both
-        :data:`_MIN_OCR_CONFIDENCE` and having at least one Japanese
-        character.
+        nothing was captured on either pass, the model is unavailable or
+        busy, the frontmost app is a blocked dev tool
+        (:data:`_OCR_BLOCKED_APPS`), Chrome's active tab is a blocked AI chat
+        site (:data:`_BLOCKED_DOMAINS`), the region is too low-contrast to
+        hold text, or no detected line clears both :data:`_MIN_OCR_CONFIDENCE`
+        and having at least one Japanese character.
 
-    Concurrency: a process-wide lock serialises capture + inference — see
-    :data:`_infer_lock`. If it can't be acquired quickly this returns ``None``
-    (skip OCR for this hover) rather than queue — the cursor has usually moved
-    on anyway. The one-time model load happens before the lock, is slow but
+    The one-time model load happens before any gating or capture, is slow but
     bounded, and runs once (normally on the startup warmup thread).
 
     Caching: a hover within :data:`_OCR_CACHE_RADIUS` px of the last call
@@ -479,61 +553,10 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         if any(blocked in url for blocked in _BLOCKED_DOMAINS):
             return None
 
-    if not _infer_lock.acquire(timeout=_OCR_LOCK_WAIT_S):
-        return None
-    try:
-        left = x - _OCR_REGION_WIDTH / 2
-        top = y - _OCR_REGION_HEIGHT / 2
-        image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
-        if image is None or not _has_text_contrast(image):
-            _last_ocr_cache = {"x": x, "y": y, "text": None}
-            return None
-        try:
-            results = model.predict(np.array(image))
-        except Exception:
-            _last_ocr_cache = {"x": x, "y": y, "text": None}
-            return None
-    finally:
-        _infer_lock.release()
+    text = _run_ocr_pass(model, x, y)
+    if text is None:
+        text = _run_ocr_pass(model, x, y - _OCR_RETRY_Y_SHIFT)
 
-    if not results:
-        _last_ocr_cache = {"x": x, "y": y, "text": None}
-        return None
-    result = results[0]
-    texts = result.get("rec_texts") or []
-    scores = result.get("rec_scores") or []
-    boxes = result.get("rec_boxes")
-    if boxes is None or len(texts) == 0:
-        _last_ocr_cache = {"x": x, "y": y, "text": None}
-        return None
-
-    # The capture region is centred on the cursor, so the cursor sits at the
-    # exact centre of the image regardless of x/y — the closest detected line
-    # to that point is the one the user is actually pointing at.
-    cursor_in_image = (_OCR_REGION_WIDTH / 2, _OCR_REGION_HEIGHT / 2)
-    best_text: str | None = None
-    best_distance = float("inf")
-    for text, score, box in zip(texts, scores, boxes):
-        if score < _MIN_OCR_CONFIDENCE:
-            continue
-        if not _JAPANESE_RE.search(text):
-            continue
-        box_x1, box_y1, box_x2, box_y2 = (float(v) for v in box[:4])
-        box_center = ((box_x1 + box_x2) / 2, (box_y1 + box_y2) / 2)
-        distance = (
-            (box_center[0] - cursor_in_image[0]) ** 2 + (box_center[1] - cursor_in_image[1]) ** 2
-        ) ** 0.5
-        if distance < best_distance:
-            best_distance = distance
-            best_text = text
-
-    if best_text is None:
-        _last_ocr_cache = {"x": x, "y": y, "text": None}
-        return None
-    text = best_text.strip()
-    if len(text) < 2:
-        _last_ocr_cache = {"x": x, "y": y, "text": None}
-        return None
     _last_ocr_cache = {"x": x, "y": y, "text": text}
     return text
 

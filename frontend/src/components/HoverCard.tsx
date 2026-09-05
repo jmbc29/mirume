@@ -9,6 +9,9 @@ const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
 const CARD_MAX_WIDTH = 340;
 const CARD_MAX_HEIGHT = 380;
+/** Extra room (beyond the card's own max size) given to the overlay window
+ *  when it shrinks to the card's bounds, so the box-shadow isn't clipped. */
+const WINDOW_PADDING = 16;
 const MAX_WORDS_SHOWN = 3;
 const MEANING_MAX_CHARS = 50;
 
@@ -187,12 +190,6 @@ function EnglishTranslationEntry({ translation }: { translation: TranslationOut 
   );
 }
 
-function clampToViewport(x: number, y: number): { left: number; top: number } {
-  const maxLeft = Math.max(0, window.innerWidth - CARD_MAX_WIDTH - 8);
-  const maxTop = Math.max(0, window.innerHeight - CARD_MAX_HEIGHT - 8);
-  return { left: Math.min(x, maxLeft), top: Math.min(y, maxTop) };
-}
-
 interface HoverCardProps {
   data: HoverResponse | null;
   triggerPoint: CursorPosition;
@@ -232,7 +229,13 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
     if (!hasContent) {
       setVisible(false);
       setDisplayData(null);
+      setLockedPosition(null);
       window.clearTimeout(hideTimeoutRef.current);
+      // Grow the overlay back to full-screen click-through so the app
+      // underneath gets clicks again.
+      void invoke("hide_card_window").catch(() => {
+        // Not running inside Tauri (e.g. plain browser dev) — ignore.
+      });
       return;
     }
     setDisplayData(data);
@@ -240,27 +243,26 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
     setVisible(true);
     window.clearTimeout(hideTimeoutRef.current);
     hideTimeoutRef.current = window.setTimeout(() => setVisible(false), AUTO_HIDE_MS);
+    // Shrink the overlay window down to the card's own rect and make it
+    // capture clicks, so Save actually receives them instead of passing them
+    // through to the app underneath. See lib.rs for why this can't just be
+    // an `ignore` toggle on the (otherwise full-screen) window.
+    void invoke("show_card_window", {
+      x: triggerPoint.x + CURSOR_OFFSET,
+      y: triggerPoint.y + CURSOR_OFFSET,
+      width: CARD_MAX_WIDTH + WINDOW_PADDING,
+      height: CARD_MAX_HEIGHT + WINDOW_PADDING,
+    }).catch(() => {
+      // Not running inside Tauri (e.g. plain browser dev) — ignore.
+    });
     return () => window.clearTimeout(hideTimeoutRef.current);
     // Deliberately keyed on `data` only — triggerPoint is captured at the
     // moment new data arrives, not tracked live.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
-  // The frontend still pings the Rust side when the card shows/hides, but the
-  // overlay is always kept click-through there — it must never block the app
-  // underneath. The inner card div opts back into pointer events on its own.
-  useEffect(() => {
-    void invoke("set_click_through", { ignore: !visible }).catch(() => {
-      // Not running inside Tauri (e.g. plain browser dev) — ignore.
-    });
-  }, [visible]);
-
   if (!displayData || !lockedPosition) return null;
 
-  const { left, top } = clampToViewport(
-    lockedPosition.x + CURSOR_OFFSET,
-    lockedPosition.y + CURSOR_OFFSET
-  );
   const topWords = pickTopWords(displayData.tokens);
   const totalContentWords = displayData.tokens.filter((t) => t.is_content_word).length;
   const hiddenCount = Math.max(0, totalContentWords - topWords.length);
@@ -282,7 +284,7 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   };
 
   return (
-    <div style={{ position: "fixed", left, top, pointerEvents: "none" }}>
+    <div style={{ position: "fixed", left: 0, top: 0, pointerEvents: "none" }}>
       <div
         style={{
           maxWidth: CARD_MAX_WIDTH,

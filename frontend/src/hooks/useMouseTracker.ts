@@ -9,7 +9,13 @@ const POLL_MS = 300;
 const MIN_MOVE_PX = 20;
 /** The cursor must sit still (no sample further than MIN_MOVE_PX away) this
  *  long before a /hover request is fired for it. */
-const STILL_MS = 500;
+const STILL_MS = 400;
+/**
+ * When a /hover response comes back empty, PaddleOCR may have simply missed
+ * the line on this pass (see backend/ocr.py's own retry) — wait this long
+ * and retry once at the same position before actually hiding the card.
+ */
+const HOVER_RETRY_MS = 300;
 /**
  * Once the cursor drifts more than this far from the point that triggered the
  * last hover request, that reference point is stale — forget it so the next
@@ -75,10 +81,15 @@ export function useMouseTracker(): MouseTrackerState & {
   useEffect(() => {
     let cancelled = false;
 
-    const fireHover = async (position: CursorPosition) => {
-      lastCalledRef.current = position;
+    const fireHover = async (position: CursorPosition, isRetry = false) => {
+      if (!isRetry) {
+        lastCalledRef.current = position;
+      }
 
-      const requestId = ++requestIdRef.current;
+      // A retry re-queries the same logical request rather than starting a
+      // new one, so a genuinely new hover elsewhere (which does bump this)
+      // can invalidate a still-pending retry.
+      const requestId = isRetry ? requestIdRef.current : ++requestIdRef.current;
       setState((prev) => ({ ...prev, loading: true, error: null }));
       try {
         const response = await fetch(HOVER_ENDPOINT, {
@@ -95,6 +106,16 @@ export function useMouseTracker(): MouseTrackerState & {
         }
         const hasContent = json.tokens.length > 0 || json.translations.length > 0;
         if (!hasContent) {
+          if (!isRetry) {
+            // OCR can miss a line on a single pass — give it one more try
+            // at the same spot before actually hiding the card.
+            window.setTimeout(() => {
+              if (!cancelled) {
+                void fireHover(position, true);
+              }
+            }, HOVER_RETRY_MS);
+            return;
+          }
           // Backend found no real screen text — this is the only case that
           // clears the card once shown; a drifting cursor alone never does.
           setState({ data: null, loading: false, error: null });
