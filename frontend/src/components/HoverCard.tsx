@@ -1,10 +1,39 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { HoverResponse, TokenOut, TranslationOut } from "../types/hover";
+import type { GrammarPattern, HoverResponse, TokenOut, TranslationOut } from "../types/hover";
 import type { CursorPosition } from "../hooks/useMouseTracker";
 
 const SAVE_WORD_ENDPOINT = "http://127.0.0.1:8123/save/word";
 const SAVE_SENTENCE_ENDPOINT = "http://127.0.0.1:8123/save/sentence";
+const SAVE_GRAMMAR_ENDPOINT = "http://127.0.0.1:8123/save/grammar";
+
+// There's no backend endpoint to look up whether an arbitrary word/pattern
+// was saved in a past session, so "already saved" is tracked here instead —
+// a local, ever-growing registry of everything this browser profile has
+// saved, persisted across app relaunches. It is intentionally never reset
+// per-hover: a word saved in an earlier sentence should still show ✓ the
+// next time it's hovered, so membership is checked against this whole-time
+// registry rather than anything scoped to the current card.
+const SAVED_WORDS_STORAGE_KEY = "mirume-saved-words";
+const SAVED_GRAMMAR_STORAGE_KEY = "mirume-saved-grammar";
+
+function loadPersistedSet(key: string): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function persistSet(key: string, value: Set<string>): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify([...value]));
+  } catch {
+    // Best-effort only — the backend save itself already succeeded.
+  }
+}
+
 const AUTO_HIDE_MS = 4000;
 const CURSOR_OFFSET = 20;
 const CARD_MAX_WIDTH = 340;
@@ -13,7 +42,6 @@ const CARD_MAX_HEIGHT = 380;
  *  when it shrinks to the card's bounds, so the box-shadow isn't clipped. */
 const WINDOW_PADDING = 16;
 const MAX_WORDS_SHOWN = 3;
-const MEANING_MAX_CHARS = 50;
 
 const JLPT_COLORS: Record<string, string> = {
   N5: "#22c55e",
@@ -23,10 +51,6 @@ const JLPT_COLORS: Record<string, string> = {
   N1: "#ef4444",
 };
 const UNKNOWN_COLOR = "#6b7280";
-
-function truncate(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
 
 function JlptBadge({ name }: { name: string }) {
   const color = JLPT_COLORS[name];
@@ -87,15 +111,48 @@ function SentenceDisplay({ tokens }: { tokens: TokenOut[] }) {
   );
 }
 
+/** Small unobtrusive per-item save toggle; permanently "✓ Saved" once clicked. */
+function CompactSaveButton({ saved, onClick }: { saved: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={saved}
+      style={{
+        flexShrink: 0,
+        padding: "3px 8px",
+        borderRadius: 6,
+        border: "0.5px solid rgba(255,255,255,0.2)",
+        background: saved ? "rgba(34,197,94,0.2)" : "transparent",
+        color: saved ? "#22c55e" : "#94a3b8",
+        fontSize: 12,
+        cursor: saved ? "default" : "pointer",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {saved ? "✓ Saved" : "+ Save"}
+    </button>
+  );
+}
+
 /** One compact row in the top-3 rarest-words list. */
-function WordRow({ token, showBorder }: { token: TokenOut; showBorder: boolean }) {
+function WordRow({
+  token,
+  showBorder,
+  saved,
+  onSave,
+}: {
+  token: TokenOut;
+  showBorder: boolean;
+  saved: boolean;
+  onSave: () => void;
+}) {
   return (
     <div
       style={{
         display: "flex",
-        alignItems: "baseline",
+        alignItems: "center",
         gap: 8,
-        padding: "6px 0",
+        padding: "8px 0",
         borderBottom: showBorder ? "1px solid rgba(255,255,255,0.08)" : "none",
       }}
     >
@@ -108,13 +165,15 @@ function WordRow({ token, showBorder }: { token: TokenOut; showBorder: boolean }
         style={{
           fontSize: 12,
           color: "#cbd5e1",
-          marginLeft: "auto",
-          textAlign: "right",
+          flex: 1,
           overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
         }}
       >
-        {token.meaning ? truncate(token.meaning, MEANING_MAX_CHARS) : ""}
+        {token.meaning ?? ""}
       </span>
+      <CompactSaveButton saved={saved} onClick={onSave} />
     </div>
   );
 }
@@ -127,7 +186,15 @@ function pickTopWords(tokens: TokenOut[]): TokenOut[] {
     .slice(0, MAX_WORDS_SHOWN);
 }
 
-function EnglishTranslationEntry({ translation }: { translation: TranslationOut }) {
+function EnglishTranslationEntry({
+  translation,
+  savedGrammar,
+  onSaveGrammar,
+}: {
+  translation: TranslationOut;
+  savedGrammar: Set<string>;
+  onSaveGrammar: (pattern: GrammarPattern) => void;
+}) {
   const save = () => {
     void fetch(SAVE_SENTENCE_ENDPOINT, {
       method: "POST",
@@ -163,6 +230,9 @@ function EnglishTranslationEntry({ translation }: { translation: TranslationOut 
             <span
               key={g.pattern}
               style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
                 fontSize: 11,
                 padding: "2px 6px",
                 borderRadius: 6,
@@ -170,6 +240,10 @@ function EnglishTranslationEntry({ translation }: { translation: TranslationOut 
               }}
             >
               {g.pattern} · {g.jlpt_level}
+              <CompactSaveButton
+                saved={savedGrammar.has(g.pattern)}
+                onClick={() => onSaveGrammar(g)}
+              />
             </span>
           ))}
         </div>
@@ -223,6 +297,60 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   const [lockedPosition, setLockedPosition] = useState<CursorPosition | null>(null);
   const hideTimeoutRef = useRef<number | undefined>(undefined);
 
+  // Whole-time registry of everything saved from this browser profile (see
+  // the comment by SAVED_WORDS_STORAGE_KEY) — loaded once and never reset
+  // per-hover, so a word saved in an earlier sentence still shows ✓ here.
+  const [savedWords, setSavedWords] = useState<Set<string>>(() =>
+    loadPersistedSet(SAVED_WORDS_STORAGE_KEY)
+  );
+  const [savedGrammar, setSavedGrammar] = useState<Set<string>>(() =>
+    loadPersistedSet(SAVED_GRAMMAR_STORAGE_KEY)
+  );
+
+  const saveWord = async (token: TokenOut, contextSentence: string) => {
+    try {
+      const resp = await fetch(SAVE_WORD_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          word: token.surface,
+          reading: token.reading,
+          meaning: token.meaning,
+          jlpt_level: token.jlpt_name,
+          context_sentence: contextSentence,
+        }),
+      });
+      if (resp.ok) {
+        setSavedWords((prev) => {
+          const next = new Set(prev).add(token.surface);
+          persistSet(SAVED_WORDS_STORAGE_KEY, next);
+          return next;
+        });
+      }
+    } catch (e) {
+      console.error("save word failed", e);
+    }
+  };
+
+  const saveGrammarPattern = async (pattern: GrammarPattern) => {
+    try {
+      const resp = await fetch(SAVE_GRAMMAR_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pattern: pattern.pattern, jlpt_level: pattern.jlpt_level }),
+      });
+      if (resp.ok) {
+        setSavedGrammar((prev) => {
+          const next = new Set(prev).add(pattern.pattern);
+          persistSet(SAVED_GRAMMAR_STORAGE_KEY, next);
+          return next;
+        });
+      }
+    } catch (e) {
+      console.error("save grammar failed", e);
+    }
+  };
+
   const hasContent = hasRenderableContent(data);
 
   useEffect(() => {
@@ -269,17 +397,7 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
 
   const saveAll = () => {
     for (const t of topWords) {
-      void fetch(SAVE_WORD_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          word: t.surface,
-          reading: t.reading,
-          meaning: t.meaning,
-          jlpt_level: t.jlpt_name,
-          context_sentence: displayData.text,
-        }),
-      });
+      void saveWord(t, displayData.text);
     }
   };
 
@@ -316,7 +434,13 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
             />
             <div>
               {topWords.map((t, i) => (
-                <WordRow token={t} showBorder={i < topWords.length - 1} key={`word-${i}`} />
+                <WordRow
+                  token={t}
+                  showBorder={i < topWords.length - 1}
+                  saved={savedWords.has(t.surface)}
+                  onSave={() => void saveWord(t, displayData.text)}
+                  key={`word-${i}`}
+                />
               ))}
             </div>
             <div
@@ -331,12 +455,20 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
                 {totalContentWords} word{totalContentWords === 1 ? "" : "s"} total
                 {hiddenCount > 0 ? ` · ${hiddenCount} more` : ""}
               </span>
-              <SaveButton onClick={saveAll} label="Save all" />
+              <SaveButton
+                onClick={saveAll}
+                label={`Save all ${topWords.length} word${topWords.length === 1 ? "" : "s"}`}
+              />
             </div>
           </>
         )}
         {displayData.translations.map((t, i) => (
-          <EnglishTranslationEntry translation={t} key={`en-${i}`} />
+          <EnglishTranslationEntry
+            translation={t}
+            savedGrammar={savedGrammar}
+            onSaveGrammar={(g) => void saveGrammarPattern(g)}
+            key={`en-${i}`}
+          />
         ))}
       </div>
     </div>
