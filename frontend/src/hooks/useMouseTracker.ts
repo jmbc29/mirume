@@ -24,7 +24,16 @@ const HOVER_RETRY_MS = 300;
  * comes back empty (see fireHover), so a slight drift toward the card itself
  * (e.g. to click Save) doesn't make it disappear.
  */
-const MAX_DRIFT_PX = 150;
+const MAX_DRIFT_PX = 300;
+/**
+ * Once a card has been showing for less than this long, an empty /hover
+ * response is ignored instead of clearing it. Without this, reaching for the
+ * Save button re-triggers the debounced /hover cycle at the cursor's new
+ * position (now over the card's own window, not the original text), which
+ * comes back empty and would otherwise wipe the card out from under the
+ * cursor before the click lands.
+ */
+const MIN_DISPLAY_MS = 2000;
 
 interface MouseTrackerState {
   data: HoverResponse | null;
@@ -60,6 +69,7 @@ export interface CursorPosition {
 export function useMouseTracker(): MouseTrackerState & {
   cursor: CursorPosition;
   triggerPoint: CursorPosition;
+  setPaused: (paused: boolean) => void;
 } {
   const [state, setState] = useState<MouseTrackerState>({
     data: null,
@@ -77,6 +87,21 @@ export function useMouseTracker(): MouseTrackerState & {
   const lastSampleRef = useRef<CursorPosition | null>(null);
   const stillTimerRef = useRef<number | undefined>(undefined);
   const requestIdRef = useRef(0);
+  // When content last appeared — used to enforce MIN_DISPLAY_MS below.
+  const cardShownAtRef = useRef<number | null>(null);
+  // True while the cursor is physically over the card itself (see
+  // HoverCard's onMouseEnter/onMouseLeave). Polling keeps sampling the
+  // cursor while paused, but never fires or schedules a new /hover call —
+  // otherwise moving onto the card to click Save would immediately queue a
+  // fresh hover at that position (now over the card's own window, not the
+  // original text), which comes back empty and clears the card.
+  const pausedRef = useRef(false);
+  const setPaused = (paused: boolean) => {
+    pausedRef.current = paused;
+    if (paused) {
+      window.clearTimeout(stillTimerRef.current);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -116,11 +141,21 @@ export function useMouseTracker(): MouseTrackerState & {
             }, HOVER_RETRY_MS);
             return;
           }
+          const shownMs = cardShownAtRef.current ? Date.now() - cardShownAtRef.current : Infinity;
+          if (shownMs < MIN_DISPLAY_MS) {
+            // The card only just appeared — this empty response is almost
+            // certainly from a /hover fired at the cursor's current spot
+            // (e.g. now over the card itself), not evidence the original
+            // text is gone. Keep showing the existing data.
+            setState((prev) => ({ ...prev, loading: false, error: null }));
+            return;
+          }
           // Backend found no real screen text — this is the only case that
           // clears the card once shown; a drifting cursor alone never does.
           setState({ data: null, loading: false, error: null });
           return;
         }
+        cardShownAtRef.current = Date.now();
         setTriggerPoint(position);
         setState({ data: json, loading: false, error: null });
       } catch (err) {
@@ -147,6 +182,12 @@ export function useMouseTracker(): MouseTrackerState & {
         }
         if (cancelled) return;
         setCursor(position);
+
+        if (pausedRef.current) {
+          // Cursor is over the card itself — don't fire or schedule a new
+          // /hover call while the user is interacting with it.
+          return;
+        }
 
         const lastSample = lastSampleRef.current;
         const moved =
@@ -190,5 +231,5 @@ export function useMouseTracker(): MouseTrackerState & {
     };
   }, []);
 
-  return { ...state, cursor, triggerPoint };
+  return { ...state, cursor, triggerPoint, setPaused };
 }

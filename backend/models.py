@@ -227,3 +227,35 @@ class WordEncounter(Base):
             f"WordEncounter(id={self.id!r}, surface={self.surface!r}, "
             f"encountered_at={self.encountered_at!r})"
         )
+
+
+class ReviewLog(Base):
+    """One graded flashcard review, logged purely to compute a review streak.
+
+    Neither :class:`SavedWord` nor :class:`SavedGrammar` retain a history of
+    past reviews (only their current SM-2 state), so "days in a row with at
+    least one review" needs its own append-only log.
+
+    Attributes:
+        id: Surrogate primary key.
+        word_id: The reviewed :class:`SavedWord`, if it still exists.
+        grade: The 0-5 self-graded recall quality that was submitted.
+        graded_at: When the review was graded.
+    """
+
+    __tablename__ = "review_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    word_id: Mapped[int | None] = mapped_column(
+        ForeignKey("saved_words.id", ondelete="SET NULL"), default=None
+    )
+    grade: Mapped[int] = mapped_column(Integer)
+
+    graded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, server_default=func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        """Return a concise developer-facing representation."""
+        return f"ReviewLog(id={self.id!r}, word_id={self.word_id!r}, grade={self.grade!r})"

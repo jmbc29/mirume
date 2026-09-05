@@ -48,6 +48,7 @@ from sqlalchemy import Boolean, Integer, String, Text, delete, insert, or_, sele
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from database import DATA_DIR, JMdictBase, JMdictSession, jmdict_engine
+from sentences import ExampleSentence, WordSentence
 from tokeniser import Token, tokenise
 
 # --------------------------------------------------------------------------- #
@@ -807,6 +808,33 @@ def get_kanji_breakdown(word: str) -> list[KanjiInfo]:
                 )
             )
     return breakdown
+
+
+def get_example_sentences(word: str, limit: int = 3) -> list[dict]:
+    """Return up to ``limit`` Tatoeba example sentences containing ``word``.
+
+    Looks ``word`` up in :class:`sentences.WordSentence` (built from
+    Tatoeba's own per-sentence word segmentation by
+    :func:`sentences.build_example_sentences_tables`) and returns the
+    matching :class:`sentences.ExampleSentence` rows. Empty if the example
+    sentences tables haven't been built yet, or no sentence contains the word.
+
+    Args:
+        word: A surface or dictionary form, e.g. ``"食べる"``.
+        limit: Maximum number of sentences to return.
+
+    Returns:
+        A list of ``{"japanese": str, "english": str}`` dicts, in no
+        particular order, at most ``limit`` long.
+    """
+    with JMdictSession() as session:
+        rows = session.execute(
+            select(ExampleSentence.japanese, ExampleSentence.english)
+            .join(WordSentence, WordSentence.sentence_id == ExampleSentence.id)
+            .where(WordSentence.word == word)
+            .limit(limit)
+        ).all()
+    return [{"japanese": japanese, "english": english} for japanese, english in rows]
 
 
 # --------------------------------------------------------------------------- #

@@ -3,11 +3,11 @@ import HoverCard from "./components/HoverCard";
 import "./App.css";
 
 function App() {
-  const { data, triggerPoint } = useMouseTracker();
+  const { data, triggerPoint, setPaused } = useMouseTracker();
 
   return (
     <div className="overlay" style={{ pointerEvents: "none" }}>
-      <HoverCard data={data} triggerPoint={triggerPoint} />
+      <HoverCard data={data} triggerPoint={triggerPoint} setHoverPaused={setPaused} />
     </div>
   );
 }

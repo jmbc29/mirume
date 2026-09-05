@@ -28,6 +28,11 @@ died and the server must be stopped and restarted. Routes:
 * ``POST /encounter`` – log a passive hover exposure for progress stats.
 * ``GET  /review`` / ``POST /review/grade`` – SM-2 spaced-repetition review
   queue (:mod:`spaced_rep`).
+* ``GET  /review/words`` / ``GET /review/flashcard`` /
+  ``DELETE /review/words/{id}`` – data for the separate review window (see
+  ``frontend/src/ReviewApp.tsx``).
+* ``GET  /word/{word}/sentences`` – up to 3 Tatoeba example sentences for a
+  word (:mod:`sentences`).
 * ``GET  /stats`` – aggregate progress statistics.
 
 Before first use:
@@ -47,7 +52,7 @@ import os
 import re
 import threading
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -67,10 +72,19 @@ from jlpt import (
     KanjiInfo,
     classify_tokens,
     dictionary_ready,
+    get_example_sentences,
     get_kanji_breakdown,
 )
 from language import detect_language
-from models import JLPT_LEVELS, SavedGrammar, SavedSentence, SavedWord, WordEncounter
+from sentences import example_sentences_ready
+from models import (
+    JLPT_LEVELS,
+    ReviewLog,
+    SavedGrammar,
+    SavedSentence,
+    SavedWord,
+    WordEncounter,
+)
 from spaced_rep import sm2
 from tokeniser import tokenise
 from translator import TranslatorNotConfiguredError, english_to_japanese
@@ -99,6 +113,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Control back to FastAPI for the lifetime of the application.
     """
     init_databases()
+    if not example_sentences_ready():
+        print(
+            "\n[mirume] Tatoeba example sentences are not built yet — "
+            "/word/{word}/sentences and the review window's flashcards will "
+            "return no example sentences.\n"
+            "[mirume] Run:  python sentences.py build\n"
+        )
     if not dictionary_ready():
         print(
             "\n[mirume] JMdict dictionary is not built yet — /hover will return "
@@ -445,6 +466,48 @@ class GradeResponse(BaseModel):
     interval_days: int
 
 
+class ExampleSentenceOut(BaseModel):
+    """One Tatoeba example sentence for a word."""
+
+    japanese: str = Field(description="The Japanese sentence text.")
+    english: str = Field(description="The English translation.")
+
+
+class WordSentencesResponse(BaseModel):
+    """Body returned by ``GET /word/{word}/sentences``."""
+
+    word: str
+    sentences: list[ExampleSentenceOut]
+
+
+class ReviewWordsResponse(BaseModel):
+    """Body returned by ``GET /review/words``."""
+
+    total: int = Field(description="Total number of saved words.")
+    by_level: dict[str, list[SavedWordOut]] = Field(
+        description="Saved words grouped by JLPT level (N1..N5; 'unknown' omitted)."
+    )
+    due_today: int = Field(description="Number of words currently due for review.")
+    streak: int = Field(description="Consecutive days, ending today, with >=1 graded review.")
+
+
+class FlashcardResponse(BaseModel):
+    """Body returned by ``GET /review/flashcard``."""
+
+    word: SavedWordOut | None = Field(
+        description="The next word due for review, or null when none are due."
+    )
+    sentences: list[ExampleSentenceOut] = Field(
+        description="Up to 3 Tatoeba example sentences for the word."
+    )
+
+
+class DeleteWordResponse(BaseModel):
+    """Body returned by ``DELETE /review/words/{word_id}``."""
+
+    deleted: bool
+
+
 #: Hiragana, katakana and CJK ideograph ranges — used to split hover text into
 #: same-script runs so mixed Japanese/English text can be routed per-segment.
 _JAPANESE_SCRIPT_RE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
@@ -510,6 +573,32 @@ def _segment_by_script(text: str) -> list[tuple[str, str]]:
     if buffer.strip():
         segments.append((kind or "en", buffer))
     return [(k, s) for k, s in segments if s.strip()]
+
+
+def _compute_review_streak(db: Session) -> int:
+    """Count consecutive days, ending today, with at least one graded review.
+
+    Walks backwards from today (UTC) counting a day as "reviewed" if
+    :class:`ReviewLog` has any row graded on it, stopping at the first gap.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        The streak length in days (0 if no review was graded today).
+    """
+    reviewed_dates = {
+        datetime.strptime(row, "%Y-%m-%d").date()
+        for row in db.execute(
+            select(func.date(ReviewLog.graded_at)).distinct()
+        ).scalars()
+    }
+    streak = 0
+    day = datetime.now(timezone.utc).date()
+    while day in reviewed_dates:
+        streak += 1
+        day -= timedelta(days=1)
+    return streak
 
 
 # --------------------------------------------------------------------------- #
@@ -647,6 +736,24 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
         tokens=tokens,
         kanji=kanji,
         translations=translations,
+    )
+
+
+@app.get("/word/{word}/sentences", response_model=WordSentencesResponse)
+def word_sentences(word: str) -> WordSentencesResponse:
+    """Return up to 3 Tatoeba example sentences containing ``word``.
+
+    Args:
+        word: A surface or dictionary form to look up.
+
+    Returns:
+        A :class:`WordSentencesResponse`; ``sentences`` is empty if the
+        example-sentence tables haven't been built yet (see
+        ``python sentences.py build``) or no sentence contains the word.
+    """
+    return WordSentencesResponse(
+        word=word,
+        sentences=[ExampleSentenceOut(**s) for s in get_example_sentences(word, limit=3)],
     )
 
 
@@ -799,6 +906,91 @@ def get_review(db: Session = Depends(get_mirume_session)) -> ReviewResponse:
     return ReviewResponse(due_count=len(words), words=words)
 
 
+@app.get("/review/words", response_model=ReviewWordsResponse)
+def get_review_words(db: Session = Depends(get_mirume_session)) -> ReviewWordsResponse:
+    """Return every saved word, grouped by JLPT level, for the review window.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`ReviewWordsResponse`. Words with ``jlpt_level="unknown"``
+        are counted in ``total`` but omitted from ``by_level`` (which only
+        has N1..N5 buckets).
+    """
+    all_words = db.execute(select(SavedWord)).scalars().all()
+
+    by_level: dict[str, list[SavedWordOut]] = {level: [] for level in JLPT_LEVELS if level != "unknown"}
+    for word in all_words:
+        out = SavedWordOut.model_validate(word)
+        if word.jlpt_level in by_level:
+            by_level[word.jlpt_level].append(out)
+
+    # Compared in SQL (SQLite's own string comparison), not against a Python
+    # datetime: SQLite hands back *naive* datetimes for a `DateTime(timezone=
+    # True)` column, which can't be compared to an aware `datetime.now(...)`
+    # in Python without an explicit strip/attach step.
+    now = datetime.now(timezone.utc)
+    due_today = db.execute(
+        select(func.count()).select_from(SavedWord).where(SavedWord.due_date <= now)
+    ).scalar_one()
+
+    return ReviewWordsResponse(
+        total=len(all_words),
+        by_level=by_level,
+        due_today=due_today,
+        streak=_compute_review_streak(db),
+    )
+
+
+@app.get("/review/flashcard", response_model=FlashcardResponse)
+def get_flashcard(db: Session = Depends(get_mirume_session)) -> FlashcardResponse:
+    """Return the next word due for review, per SM-2, with example sentences.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`FlashcardResponse` with ``word=None`` when nothing is due
+        (the review window shows an "All done!" screen in that case).
+    """
+    now = datetime.now(timezone.utc)
+    word = db.execute(
+        select(SavedWord).where(SavedWord.due_date <= now).order_by(SavedWord.due_date).limit(1)
+    ).scalar_one_or_none()
+    if word is None:
+        return FlashcardResponse(word=None, sentences=[])
+
+    sentences = get_example_sentences(word.surface, limit=3)
+    return FlashcardResponse(
+        word=SavedWordOut.model_validate(word),
+        sentences=[ExampleSentenceOut(**s) for s in sentences],
+    )
+
+
+@app.delete("/review/words/{word_id}", response_model=DeleteWordResponse)
+def delete_review_word(word_id: int, db: Session = Depends(get_mirume_session)) -> DeleteWordResponse:
+    """Delete a saved word from the review window's word list.
+
+    Args:
+        word_id: Id of the :class:`SavedWord` to delete.
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`DeleteWordResponse`; ``deleted`` is ``False`` if no word
+        with that id existed.
+
+    Raises:
+        HTTPException: 404 if no :class:`SavedWord` matches ``word_id``.
+    """
+    word = db.get(SavedWord, word_id)
+    if word is None:
+        raise HTTPException(status_code=404, detail="word not found")
+    db.delete(word)
+    db.commit()
+    return DeleteWordResponse(deleted=True)
+
+
 @app.get("/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_mirume_session)) -> StatsResponse:
     """Return aggregate progress statistics across saved words and encounters.
@@ -872,6 +1064,9 @@ def grade_review(
     word.interval_days = result.interval_days
     word.repetitions = result.repetitions
     word.due_date = result.next_review_date
+    # Logged purely so _compute_review_streak has history to count — SavedWord
+    # itself only ever tracks *current* SM-2 state, not past reviews.
+    db.add(ReviewLog(word_id=word.id, grade=request.grade))
     db.commit()
 
     return GradeResponse(

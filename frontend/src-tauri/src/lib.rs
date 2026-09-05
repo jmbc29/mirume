@@ -1,4 +1,5 @@
 use tauri::Manager;
+use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 /// Logical (point) size of the overlay's full-screen resting state — the
 /// whole primary monitor, from (0, 0). Captured once in `setup` and used by
@@ -149,6 +150,50 @@ pub fn run() {
             // Start fully click-through: the overlay must never block the
             // app underneath it until a hover card is actually showing.
             window.set_ignore_cursor_events(true)?;
+
+            // Cmd+Shift+M toggles the separate review window (word list /
+            // flashcards / stats) — a normal, non-transparent window, unlike
+            // the overlay. Created lazily on first use rather than declared
+            // in tauri.conf.json, so it doesn't exist (or cost anything)
+            // until the user actually asks for it.
+            //
+            // The handler fires once per key *transition*, so it runs twice
+            // per press — once for ShortcutState::Pressed, once for
+            // ::Released — which would open then immediately re-hide the
+            // window if left unguarded; only the Pressed event toggles it.
+            app.handle().plugin(
+                tauri_plugin_global_shortcut::Builder::new()
+                    .with_shortcut(Shortcut::new(
+                        Some(Modifiers::SUPER | Modifiers::SHIFT),
+                        Code::KeyM,
+                    ))?
+                    .with_handler(|app, _shortcut, event| {
+                        if event.state() != ShortcutState::Pressed {
+                            return;
+                        }
+                        if let Some(window) = app.get_webview_window("review") {
+                            let visible = window.is_visible().unwrap_or(false);
+                            if visible {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        } else {
+                            let _ = tauri::WebviewWindowBuilder::new(
+                                app,
+                                "review",
+                                tauri::WebviewUrl::App("review.html".into()),
+                            )
+                            .title("Mirume — Review")
+                            .inner_size(800.0, 600.0)
+                            .resizable(true)
+                            .build();
+                        }
+                    })
+                    .build(),
+            )?;
+
             Ok(())
         })
         .run(tauri::generate_context!())

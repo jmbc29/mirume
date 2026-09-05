@@ -267,6 +267,7 @@ function EnglishTranslationEntry({
 interface HoverCardProps {
   data: HoverResponse | null;
   triggerPoint: CursorPosition;
+  setHoverPaused: (paused: boolean) => void;
 }
 
 /**
@@ -288,7 +289,7 @@ function hasRenderableContent(d: HoverResponse | null): boolean {
   return true;
 }
 
-export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
+export default function HoverCard({ data, triggerPoint, setHoverPaused }: HoverCardProps) {
   const [visible, setVisible] = useState(false);
   const [displayData, setDisplayData] = useState<HoverResponse | null>(null);
   // Screen position the card is pinned to. Set once when new data arrives and
@@ -404,6 +405,16 @@ export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   return (
     <div style={{ position: "fixed", left: 0, top: 0, pointerEvents: "none" }}>
       <div
+        // The overlay window is already sized to this card and non-click-
+        // through while visible (see show_card_window above), so these
+        // don't toggle click-through — they pause the mouse tracker's own
+        // /hover polling while the cursor is over the card, so reaching for
+        // Save doesn't fire a new (now-over-the-card, therefore empty)
+        // /hover request that would otherwise clear the card out from under
+        // the cursor. See useMouseTracker's MIN_DISPLAY_MS for the other
+        // half of this fix.
+        onMouseEnter={() => setHoverPaused(true)}
+        onMouseLeave={() => setHoverPaused(false)}
         style={{
           maxWidth: CARD_MAX_WIDTH,
           maxHeight: CARD_MAX_HEIGHT,
