@@ -81,8 +81,8 @@ except Exception as exc:  # pragma: no cover - dependency missing
 #: Taller than the old manga-ocr region (400x100) since PaddleOCR's detector
 #: needs enough vertical room to isolate the line the cursor is on from the
 #: lines immediately above/below it, rather than reading everything at once.
-_OCR_REGION_WIDTH = 400
-_OCR_REGION_HEIGHT = 200
+_OCR_REGION_WIDTH = 600
+_OCR_REGION_HEIGHT = 300
 
 #: Hard ceiling on the ``screencapture`` CLI. It normally returns in well under
 #: 200 ms; anything longer means it is wedged (a permission prompt, a stuck
@@ -158,6 +158,13 @@ _BLOCKED_DOMAINS: frozenset[str] = frozenset(
 _ocr_instance = None  # cached paddleocr.PaddleOCR instance
 _ocr_load_failed = False
 _model_lock = threading.Lock()  # serialise the one-time load across threads
+
+#: Last OCR result, keyed by the cursor position it was computed for. A hover
+#: that lands within :data:`_OCR_CACHE_RADIUS` px of the last call reuses this
+#: instead of re-running capture + inference (~2-3s), since a cursor that has
+#: only nudged a few pixels is almost always still over the same line of text.
+_last_ocr_cache: dict = {"x": -9999.0, "y": -9999.0, "text": None}
+_OCR_CACHE_RADIUS = 100
 
 #: Held for the duration of every capture + PaddleOCR inference. Concurrent
 #: PaddleOCR calls have not shown the crash-on-overlap behaviour manga-ocr's
@@ -440,7 +447,17 @@ def extract_text_at_position(x: float, y: float) -> str | None:
     (skip OCR for this hover) rather than queue — the cursor has usually moved
     on anyway. The one-time model load happens before the lock, is slow but
     bounded, and runs once (normally on the startup warmup thread).
+
+    Caching: a hover within :data:`_OCR_CACHE_RADIUS` px of the last call
+    returns the cached result immediately instead of re-running capture +
+    inference — see :data:`_last_ocr_cache`.
     """
+    global _last_ocr_cache
+    dx = x - _last_ocr_cache["x"]
+    dy = y - _last_ocr_cache["y"]
+    if (dx * dx + dy * dy) < _OCR_CACHE_RADIUS**2:
+        return _last_ocr_cache["text"]
+
     model = _get_model()
     if model is None:
         return None
@@ -469,21 +486,25 @@ def extract_text_at_position(x: float, y: float) -> str | None:
         top = y - _OCR_REGION_HEIGHT / 2
         image = capture_region(left, top, _OCR_REGION_WIDTH, _OCR_REGION_HEIGHT)
         if image is None or not _has_text_contrast(image):
+            _last_ocr_cache = {"x": x, "y": y, "text": None}
             return None
         try:
             results = model.predict(np.array(image))
         except Exception:
+            _last_ocr_cache = {"x": x, "y": y, "text": None}
             return None
     finally:
         _infer_lock.release()
 
     if not results:
+        _last_ocr_cache = {"x": x, "y": y, "text": None}
         return None
     result = results[0]
     texts = result.get("rec_texts") or []
     scores = result.get("rec_scores") or []
     boxes = result.get("rec_boxes")
     if boxes is None or len(texts) == 0:
+        _last_ocr_cache = {"x": x, "y": y, "text": None}
         return None
 
     # The capture region is centred on the cursor, so the cursor sits at the
@@ -507,10 +528,13 @@ def extract_text_at_position(x: float, y: float) -> str | None:
             best_text = text
 
     if best_text is None:
+        _last_ocr_cache = {"x": x, "y": y, "text": None}
         return None
     text = best_text.strip()
     if len(text) < 2:
+        _last_ocr_cache = {"x": x, "y": y, "text": None}
         return None
+    _last_ocr_cache = {"x": x, "y": y, "text": text}
     return text
 
 

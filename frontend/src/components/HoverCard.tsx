@@ -195,7 +195,7 @@ function clampToViewport(x: number, y: number): { left: number; top: number } {
 
 interface HoverCardProps {
   data: HoverResponse | null;
-  cursor: CursorPosition;
+  triggerPoint: CursorPosition;
 }
 
 /**
@@ -217,9 +217,13 @@ function hasRenderableContent(d: HoverResponse | null): boolean {
   return true;
 }
 
-export default function HoverCard({ data, cursor }: HoverCardProps) {
+export default function HoverCard({ data, triggerPoint }: HoverCardProps) {
   const [visible, setVisible] = useState(false);
   const [displayData, setDisplayData] = useState<HoverResponse | null>(null);
+  // Screen position the card is pinned to. Set once when new data arrives and
+  // never touched again while that data is showing, so the card doesn't
+  // chase the live cursor and run away when the user reaches for Save.
+  const [lockedPosition, setLockedPosition] = useState<CursorPosition | null>(null);
   const hideTimeoutRef = useRef<number | undefined>(undefined);
 
   const hasContent = hasRenderableContent(data);
@@ -232,10 +236,13 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
       return;
     }
     setDisplayData(data);
+    setLockedPosition(triggerPoint);
     setVisible(true);
     window.clearTimeout(hideTimeoutRef.current);
     hideTimeoutRef.current = window.setTimeout(() => setVisible(false), AUTO_HIDE_MS);
     return () => window.clearTimeout(hideTimeoutRef.current);
+    // Deliberately keyed on `data` only — triggerPoint is captured at the
+    // moment new data arrives, not tracked live.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
 
@@ -248,9 +255,12 @@ export default function HoverCard({ data, cursor }: HoverCardProps) {
     });
   }, [visible]);
 
-  if (!displayData) return null;
+  if (!displayData || !lockedPosition) return null;
 
-  const { left, top } = clampToViewport(cursor.x + CURSOR_OFFSET, cursor.y + CURSOR_OFFSET);
+  const { left, top } = clampToViewport(
+    lockedPosition.x + CURSOR_OFFSET,
+    lockedPosition.y + CURSOR_OFFSET
+  );
   const topWords = pickTopWords(displayData.tokens);
   const totalContentWords = displayData.tokens.filter((t) => t.is_content_word).length;
   const hiddenCount = Math.max(0, totalContentWords - topWords.length);

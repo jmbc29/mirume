@@ -9,13 +9,16 @@ const POLL_MS = 300;
 const MIN_MOVE_PX = 20;
 /** The cursor must sit still (no sample further than MIN_MOVE_PX away) this
  *  long before a /hover request is fired for it. */
-const STILL_MS = 600;
+const STILL_MS = 500;
 /**
  * Once the cursor drifts more than this far from the point that triggered the
- * last hover request, the card is stale — drop the data immediately so it
- * disappears instead of lingering over unrelated screen content.
+ * last hover request, that reference point is stale — forget it so the next
+ * still-pause fires a fresh /hover call. This does NOT clear the currently
+ * displayed card; the card is only cleared when a /hover response actually
+ * comes back empty (see fireHover), so a slight drift toward the card itself
+ * (e.g. to click Save) doesn't make it disappear.
  */
-const MAX_DRIFT_PX = 50;
+const MAX_DRIFT_PX = 150;
 
 interface MouseTrackerState {
   data: HoverResponse | null;
@@ -48,13 +51,21 @@ export interface CursorPosition {
  * screen keeps resetting the timer and never triggers a request; only a
  * deliberate pause over one spot does.
  */
-export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition } {
+export function useMouseTracker(): MouseTrackerState & {
+  cursor: CursorPosition;
+  triggerPoint: CursorPosition;
+} {
   const [state, setState] = useState<MouseTrackerState>({
     data: null,
     loading: false,
     error: null,
   });
   const [cursor, setCursor] = useState<CursorPosition>({ x: 0, y: 0 });
+  // Cursor position at the moment the *currently displayed* data arrived.
+  // Only updated when a new /hover response carries real content — this is
+  // what the hover card locks its position to, so it doesn't chase the
+  // live cursor once shown (see HoverCard).
+  const [triggerPoint, setTriggerPoint] = useState<CursorPosition>({ x: 0, y: 0 });
 
   const lastCalledRef = useRef<CursorPosition | null>(null);
   const lastSampleRef = useRef<CursorPosition | null>(null);
@@ -82,11 +93,14 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
         if (requestId !== requestIdRef.current || cancelled) {
           return;
         }
-        if (json.source === "placeholder") {
-          // Backend found no real screen text — keep the card hidden.
+        const hasContent = json.tokens.length > 0 || json.translations.length > 0;
+        if (!hasContent) {
+          // Backend found no real screen text — this is the only case that
+          // clears the card once shown; a drifting cursor alone never does.
           setState({ data: null, loading: false, error: null });
           return;
         }
+        setTriggerPoint(position);
         setState({ data: json, loading: false, error: null });
       } catch (err) {
         if (requestId === requestIdRef.current) {
@@ -124,17 +138,18 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
         }
         lastSampleRef.current = position;
 
-        // The cursor is actively moving again, so a previously shown card no
-        // longer matches where it's pointing. Hide it once the drift from
-        // the point that triggered it is large enough to be a different
-        // target, and clear the trigger point so drift isn't measured
-        // against stale data.
+        // The cursor is actively moving again. Once it has drifted far enough
+        // from the point that triggered the last /hover call, that reference
+        // point no longer describes a nearby target — forget it so the next
+        // still-pause fires a fresh call. This does NOT hide the card: the
+        // card is only cleared when a /hover response itself comes back
+        // empty, so drifting toward the card (e.g. to click Save) never
+        // makes it disappear.
         const lastCalled = lastCalledRef.current;
         if (lastCalled) {
           const drift = Math.hypot(position.x - lastCalled.x, position.y - lastCalled.y);
           if (drift > MAX_DRIFT_PX) {
             lastCalledRef.current = null;
-            setState((prev) => (prev.data ? { ...prev, data: null } : prev));
           }
         }
 
@@ -154,5 +169,5 @@ export function useMouseTracker(): MouseTrackerState & { cursor: CursorPosition 
     };
   }, []);
 
-  return { ...state, cursor };
+  return { ...state, cursor, triggerPoint };
 }
