@@ -1,5 +1,74 @@
+use std::process::{Child, Command};
+use std::sync::Mutex;
+
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
+
+/// Handle to the bundled Python backend child process, so it can be killed when
+/// the app quits. `None` in a `tauri dev` run, where the backend is started
+/// separately (`uvicorn main:app ...`) and this app must not try to manage it.
+struct BackendProcess(Mutex<Option<Child>>);
+
+/// Start the bundled backend (`Contents/Resources/backend/mirume-backend`, a
+/// PyInstaller one-dir build of `backend/mirume_server.py`).
+///
+/// The backend is told where to keep its writable data
+/// (`~/Library/Application Support/com.mirume.app`, via `MIRUME_DATA_DIR`) and
+/// where the read-only seed files shipped in the bundle live
+/// (`Contents/Resources/backend-data`, via `MIRUME_BUNDLED_RES` — see
+/// `backend/paths.py`). `MIRUME_PARENT_PID` lets it exit on its own if this
+/// process dies without getting the chance to kill it (a crash), so a stray
+/// uvicorn never keeps port 8123 bound.
+///
+/// Returns `None` — leaving hover to fail until a backend is reachable, which
+/// the frontend already tolerates — when the bundled binary isn't present
+/// (development) or the spawn fails.
+fn spawn_backend(app: &tauri::AppHandle) -> Option<Child> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    let exe = resource_dir.join("backend").join("mirume-backend");
+    if !exe.exists() {
+        eprintln!(
+            "[mirume] bundled backend not found ({}); assuming `tauri dev` — start it \
+             with `uvicorn main:app --reload --reload-exclude 'venv/*' --port 8123`",
+            exe.display()
+        );
+        return None;
+    }
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .expect("app_data_dir is always resolvable on macOS");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let seed_dir = resource_dir.join("backend-data");
+
+    match Command::new(&exe)
+        .current_dir(&resource_dir)
+        .env("MIRUME_DATA_DIR", &data_dir)
+        .env("MIRUME_BUNDLED_RES", &seed_dir)
+        .env("MIRUME_PARENT_PID", std::process::id().to_string())
+        .spawn()
+    {
+        Ok(child) => {
+            println!("[mirume] backend started (pid {})", child.id());
+            Some(child)
+        }
+        Err(err) => {
+            eprintln!("[mirume] failed to start bundled backend: {err}");
+            None
+        }
+    }
+}
+
+/// Kill the backend child, if one is running. Called once on `RunEvent::Exit`.
+fn shutdown_backend(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<BackendProcess>() {
+        if let Some(mut child) = state.0.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 /// Show the hover card window at ``(x, y)`` and make it capture clicks.
 ///
@@ -168,6 +237,11 @@ pub fn run() {
             open_review_window
         ])
         .setup(|app| {
+            // Start the bundled backend first thing, so it's booting while the
+            // windows are configured. Harmless in dev (returns None).
+            let backend = spawn_backend(app.handle());
+            app.manage(BackendProcess(Mutex::new(backend)));
+
             let main = app.get_webview_window("main").expect("main window not found");
 
             // Stretch the overlay to cover the whole primary monitor from its
@@ -230,6 +304,11 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                shutdown_backend(app_handle);
+            }
+        });
 }

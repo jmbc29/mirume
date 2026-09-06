@@ -1,12 +1,18 @@
+# Mirume backend dependencies. Pinned versions live in backend/requirements.txt;
+# this is the annotated overview. Install either one:
+#   pip install -r requirements.txt            (from the repo root)
+#   pip install -r ../requirements.txt         (from backend/)
+
 # Web server
 fastapi
 uvicorn
-watchfiles          # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree and can wedge the worker
+watchfiles          # dev-only: event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree and can wedge the worker
 
 # macOS Accessibility API + cursor / screenshot (accessibility.py, ocr.py)
 pyobjc-framework-Cocoa
 pyobjc-framework-ApplicationServices
 pyobjc-framework-Quartz
+pyobjc-framework-Vision   # screenshot OCR fallback for Chrome/sandboxed web content; built into macOS 13+, no model download
 
 # Japanese NLP
 fugashi             # MeCab tokeniser wrapper (tokeniser.py)
@@ -18,14 +24,13 @@ sqlalchemy
 pydantic
 
 # Translation (both optional at runtime — see backend/.env)
-python-dotenv       # translator.py loads backend/.env
+python-dotenv       # translator.py loads .env
 deepl               # translator.py: DeepL English<->Japanese, when DEEPL_API_KEY is set
 anthropic           # translator.py: Claude JA->EN sentence fallback, when ANTHROPIC_API_KEY is set
 
-# OCR fallback for sandboxed content Chrome/Electron don't expose to the AX tree (ocr.py)
-numpy               # imported unconditionally by ocr.py
+# Screenshot capture for the OCR fallback (ocr.py)
+numpy               # <2; imported by fasttext
 pillow
-paddleocr           # pulls in paddlepaddle (~large); OCR degrades gracefully if the import fails
 
 # Misc
 requests            # dictionary / model / Tatoeba downloads

@@ -1,6 +1,6 @@
 fastapi==0.141.1
 uvicorn==0.52.4
-watchfiles==1.2.0  # event-based --reload watcher; without it uvicorn stat-polls the whole venv/ tree, pinning a CPU core and wedging the worker on a stray restart
+watchfiles==1.2.0  # event-based --reload watcher (dev only); without it uvicorn stat-polls the whole venv/ tree, pinning a CPU core and wedging the worker on a stray restart
 pydantic==2.13.5
 SQLAlchemy==2.0.52
 requests==2.34.2
@@ -11,9 +11,10 @@ pyobjc-framework-ApplicationServices==12.2.2
 pyobjc-framework-Cocoa==12.2.2
 pyobjc-framework-CoreText==12.2.2
 pyobjc-framework-Quartz==12.2.2
+pyobjc-framework-Vision==12.2.2  # screenshot OCR fallback for Chrome/sandboxed web content (ocr.py); built into macOS 13+, no model download
 fasttext==0.9.3
-numpy<2  # fasttext 0.9.3's predict() breaks under NumPy 2.x's stricter copy=False
+numpy==1.26.4  # <2: fasttext 0.9.3's predict() breaks under NumPy 2.x's stricter copy=False
+pillow==12.3.0  # screenshot capture + PNG encoding for the Vision OCR request
 deepl==1.32.0
 python-dotenv==1.2.3
-paddlepaddle==3.3.1  # CPU inference runtime for paddleocr
-paddleocr==3.7.0  # screenshot OCR fallback for Chrome/sandboxed web content — detection+recognition pipeline, replaced manga-ocr because it blended multiple nearby page elements into one hallucinated read on dense pages
+anthropic==1.4.0  # translator.py: Claude JA->EN sentence fallback, when ANTHROPIC_API_KEY is set

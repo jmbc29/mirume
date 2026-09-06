@@ -232,6 +232,15 @@ models/*
 # Backend virtual environment
 backend/venv/
 
+# Release packaging artifacts (regenerable — see scripts/build-dmg.sh):
+# the PyInstaller build lands in backend/dist|build/ (already covered by the
+# generic dist/ + build/ rules above), and these are the bundled seed files.
+backend/packaging/backend-data/
+
+# The generic "*.spec" rule above (PyInstaller boilerplate) also matches our
+# checked-in build spec. Un-ignore it explicitly — same trap as frontend/src/lib/.
+!backend/packaging/mirume-backend.spec
+
 # The Python-packaging `lib/` rule near the top of this file (standard
 # Python boilerplate, meant for a build-generated lib/ dir) is unanchored,
 # so it also unintentionally matches frontend/src/lib/ — real, hand-written

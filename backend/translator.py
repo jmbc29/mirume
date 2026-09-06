@@ -25,16 +25,21 @@ from __future__ import annotations
 import os
 import re
 from functools import lru_cache
-from pathlib import Path
 
 import deepl
 from dotenv import load_dotenv
 
 from jlpt import classify_tokens
 from jlpt import jlpt_name as _jlpt_name
+from paths import ENV_FILES
 from tokeniser import tokenise
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+# Load whichever ``.env`` exists — the Application Support copy in a packaged
+# app, or the one next to this source file in development (see paths.ENV_FILES).
+for _env_file in ENV_FILES:
+    if _env_file.is_file():
+        load_dotenv(_env_file)
+        break
 
 #: Formality variants requested for the "alternatives" spread, roughly
 #: casual (N5) -> polite (N4/N3) -> formal (N2). DeepL's `formality` param

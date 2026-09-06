@@ -9,17 +9,18 @@ into ``models/`` on first use.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import fasttext
 import requests
+
+from paths import MODELS_DIR
 
 #: Compressed (~917 KB) 176-language fastText identification model.
 LID_MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
 
-#: Local cache location — ``mirume/models/lid.176.ftz``.
-MODELS_DIR: Path = Path(__file__).resolve().parent.parent / "models"
-LID_MODEL_PATH: Path = MODELS_DIR / "lid.176.ftz"
+#: Local cache location — resolved by :mod:`paths` (``mirume/models/`` in
+#: development, a writable per-user directory in the packaged app, where it is
+#: also seeded from the bundle so no download is needed).
+LID_MODEL_PATH = MODELS_DIR / "lid.176.ftz"
 
 _model: fasttext.FastText._FastText | None = None
 

@@ -8,14 +8,65 @@ grammar patterns to a local SQLite database and review them later with SM-2
 spaced repetition. Everything stays on your machine (the optional DeepL /
 Anthropic translation is the only network call, and only if you add a key).
 
+## Install (packaged app)
+
+Download `Mirume_1.0.0_aarch64.dmg`, open it, and drag **Mirume** to
+Applications. The Python backend is bundled inside the app — nothing else to
+install.
+
+The `.dmg` is **ad-hoc signed, not notarized**, so Gatekeeper will refuse the
+first launch ("Mirume is damaged" / "unidentified developer"). Clear the
+quarantine flag once:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Mirume.app
+```
+
+then open it normally. On first launch macOS also validates every bundled
+library, which can take up to a minute before the hover card works; later
+launches are instant.
+
+Mirume needs two macOS permissions (**System Settings ▸ Privacy & Security**),
+granted to `Mirume.app` itself:
+
+- **Accessibility** — reads on-screen text. Without it, hover always shows the
+  placeholder sentence.
+- **Screen Recording** — the OCR fallback for Chrome / other web content the
+  Accessibility API can't see. Uses the built-in macOS Vision text recognizer;
+  no model download.
+
+Quit and reopen Mirume after granting each. Optional translation keys go in
+`~/Library/Application Support/com.mirume.app/.env` (`DEEPL_API_KEY=` and/or
+`ANTHROPIC_API_KEY=`); your saved words live in the same directory
+(`data/mirume.db`).
+
+## Build the .dmg
+
+```bash
+# one-time: add the packaging tools to the backend venv
+backend/venv/bin/pip install -r backend/requirements.txt pyinstaller
+
+scripts/build-dmg.sh
+```
+
+This freezes the backend with PyInstaller (macOS Vision replaces PaddleOCR, so
+no ~1 GB ML runtime to bundle), stages the pre-built dictionary as a
+gzip-compressed seed file, and builds + ad-hoc-signs the app and `.dmg` into
+`frontend/src-tauri/target/release/bundle/`. See
+[`backend/packaging/mirume-backend.spec`](backend/packaging/mirume-backend.spec)
+and [`frontend/src-tauri/src/lib.rs`](frontend/src-tauri/src/lib.rs) (`spawn_backend`)
+for how the backend is bundled and supervised.
+
 ## Project layout
 
 ```
 mirume/
-  backend/     FastAPI server + Japanese NLP + macOS text detection
-  frontend/    Tauri + React transparent overlay (the hover card + review window)
-  data/        Generated SQLite databases + raw JMdict/kanjidic2/Tatoeba source (gitignored)
-  models/      fastText language-ID model, downloaded on first use (gitignored)
+  backend/           FastAPI server + Japanese NLP + macOS text detection
+  backend/packaging/ PyInstaller spec for freezing the backend into the app
+  frontend/          Tauri + React transparent overlay (the hover card + review window)
+  scripts/           build-dmg.sh — one command to produce the distributable .dmg
+  data/              Generated SQLite databases + raw JMdict/kanjidic2/Tatoeba source (gitignored)
+  models/            fastText language-ID model, downloaded on first use (gitignored)
 ```
 
 ## Backend — getting started
@@ -55,9 +106,10 @@ The server listens on `http://127.0.0.1:8123`. Interactive API docs are at
   sentence (`source: "placeholder"`). Verify with `python accessibility.py`.
 - **Screen Recording** (for the OCR fallback): Chrome/Electron web content is
   invisible to the AX tree, so `ocr.py` screenshots around the cursor and runs
-  PaddleOCR. Grant Screen Recording to the same app and fully quit/reopen it.
-  Without it, hovers over browser content that the AX tree misses return
-  nothing. Verify with `python ocr.py <x> <y>`.
+  the built-in macOS Vision text recognizer (`VNRecognizeTextRequest`, macOS
+  13+; no model download). Grant Screen Recording to the same app and fully
+  quit/reopen it. Without it, hovers over browser content that the AX tree
+  misses return nothing. Verify with `python ocr.py <x> <y>`.
 
 ### Optional translation keys (`backend/.env`)
 
@@ -121,13 +173,15 @@ Same macOS permissions as the backend apply to whichever process launches it.
 | File               | Responsibility |
 | ------------------ | -------------- |
 | `main.py`          | FastAPI app + routes; the `/hover` detection → routing → classification pipeline |
+| `mirume_server.py` | Packaged-app entry point: seed bundled data, then serve `main:app` (no `--reload`) |
+| `paths.py`         | Resolves `data/` + `models/` — repo dirs in dev, a writable per-user dir in the packaged app |
 | `database.py`      | SQLAlchemy engines/sessions for `jmdict.db` and `mirume.db` |
 | `models.py`        | `SavedWord`, `SavedSentence`, `SavedGrammar`, `WordEncounter`, `ReviewLog` |
 | `tokeniser.py`     | fugashi + MeCab tokenisation (surface / reading / lemma / POS) |
 | `jlpt.py`          | JMdict/kanjidic2 parser + `Entry`/`Kanji` tables + `lookup` / `classify_tokens` / `get_kanji_breakdown` / `get_example_sentences` |
 | `language.py`      | fastText `lid.176` language identification (Japanese vs English vs mixed) |
 | `accessibility.py` | macOS AX API text detection — `get_text_at_position` / `get_focused_text` + permission handling |
-| `ocr.py`           | Screenshot + PaddleOCR fallback for content the AX tree can't see; frontmost-app / URL gating |
+| `ocr.py`           | Screenshot + macOS Vision (`VNRecognizeTextRequest`) fallback for content the AX tree can't see; frontmost-app / URL gating |
 | `translator.py`    | English↔Japanese (DeepL) and JA→EN sentence gloss (DeepL → Claude fallback) |
 | `sentences.py`     | Tatoeba example-sentence store in `jmdict.db` |
 | `spaced_rep.py`    | SM-2 review scheduling |

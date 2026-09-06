@@ -145,20 +145,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             "https://www.deepl.com/pro-api).\n"
         )
 
-    # Start the persistent OCR worker thread. It loads PaddleOCR's weights
-    # and runs its own throwaway inference pass to pay first-call JIT/kernel
-    # costs upfront too (see ocr._warm_up_inference) — both happen on the
-    # worker's own thread, entirely bypassing gating, so startup's frontmost
-    # app (almost always this backend's own launching terminal, a blocked
-    # dev tool) can never cut the warmup short the way it used to when this
-    # called extract_text_at_position(0, 0) directly. start_ocr_worker()
-    # itself only spawns that thread and returns immediately, so it's safe
-    # to call inline here rather than wrapping it in another thread.
+    # Start the persistent OCR worker thread. It issues one throwaway macOS
+    # Vision recognition request to bring that stack up before the first real
+    # hover (see ocr._warm_up_recognition) — on the worker's own thread,
+    # bypassing gating, so startup's frontmost app (almost always this
+    # backend's own launching terminal, a blocked dev tool) can't cut the
+    # warmup short. start_ocr_worker() only spawns that thread and returns
+    # immediately, so it's safe to call inline here.
     try:
         from ocr import start_ocr_worker
 
         start_ocr_worker()
-    except Exception as exc:  # pragma: no cover - model/deps optional
+    except Exception as exc:  # pragma: no cover - deps optional
         print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
               "slow on first use or unavailable.")
 

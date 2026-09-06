@@ -20,13 +20,16 @@ from typing import Iterator
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from paths import DATA_DIR  # noqa: F401  (re-exported for callers that import it here)
+
 # --------------------------------------------------------------------------- #
 # Filesystem layout
 # --------------------------------------------------------------------------- #
 
-#: Absolute path to the project-level ``data/`` directory (``mirume/data``).
-DATA_DIR: Path = Path(__file__).resolve().parent.parent / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+#: Absolute path to the ``data/`` directory holding both SQLite databases and
+#: the downloaded dictionary sources. Resolved by :mod:`paths` — the repo's
+#: own ``data/`` in development, a writable per-user directory in the packaged
+#: app.
 
 JMDICT_DB_PATH: Path = DATA_DIR / "jmdict.db"
 MIRUME_DB_PATH: Path = DATA_DIR / "mirume.db"
