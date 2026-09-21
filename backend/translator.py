@@ -14,6 +14,16 @@ of the detected sentence for the hover card. It prefers DeepL and falls back to
 the Anthropic API (``claude-sonnet-4-6``) when ``DEEPL_API_KEY`` is not set, so
 a real full-sentence translation is available with either credential.
 
+A hover rapidly crossing several sentences (or jitter re-detecting the same
+sentence) can otherwise trigger a DeepL call on every single one, so both
+directions are cached by source text (:data:`_JA_EN_CACHE`,
+:data:`_EN_JA_CACHE`) and share one process-wide rate limiter
+(:data:`_deepl_rate_limiter`) capping actual DeepL calls at 10/minute. Once
+the budget is spent, ``/hover`` degrades gracefully — a Japanese sentence
+falls back to the Claude translator (or no translation), and an English
+segment's translation is skipped for that hover — rather than blocking or
+erroring.
+
 Configure via ``backend/.env`` (loaded here with :mod:`dotenv`):
 ``DEEPL_API_KEY`` (free tier at https://www.deepl.com/pro-api) and/or
 ``ANTHROPIC_API_KEY``. With neither, :func:`japanese_to_english` returns
@@ -22,9 +32,13 @@ Configure via ``backend/.env`` (loaded here with :mod:`dotenv`):
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
+from collections import deque
 from functools import lru_cache
+from threading import Lock
 
 import deepl
 from dotenv import load_dotenv
@@ -91,6 +105,52 @@ class TranslatorNotConfiguredError(RuntimeError):
     """Raised when no ``DEEPL_API_KEY`` is set."""
 
 
+class TranslatorRateLimitedError(RuntimeError):
+    """Raised when the DeepL call budget (see :data:`_deepl_rate_limiter`) is spent."""
+
+
+_logger = logging.getLogger("mirume.translator")
+
+
+class _SlidingWindowRateLimiter:
+    """A simple ``max_calls`` per ``period_seconds`` sliding-window limiter.
+
+    Thread-safe: ``/hover`` requests run on FastAPI's executor thread pool, so
+    several hovers can race to translate at once.
+    """
+
+    def __init__(self, max_calls: int, period_seconds: float) -> None:
+        self._max_calls = max_calls
+        self._period = period_seconds
+        self._calls: deque[float] = deque()
+        self._lock = Lock()
+
+    def try_acquire(self) -> bool:
+        """Record and allow a call, or refuse it if the budget is spent.
+
+        Returns:
+            True if the call is allowed (and counted against the budget),
+            False if ``max_calls`` have already happened within the last
+            ``period_seconds``.
+        """
+        now = time.monotonic()
+        with self._lock:
+            while self._calls and now - self._calls[0] > self._period:
+                self._calls.popleft()
+            if len(self._calls) >= self._max_calls:
+                return False
+            self._calls.append(now)
+            return True
+
+
+#: Shared across both translation directions — DeepL's free tier is generous
+#: but not unlimited, and a burst of hovers (mouse sweeping across a page)
+#: shouldn't be able to fire dozens of calls in a second. 10/minute keeps
+#: normal reading fluid (each sentence is cached after its first translation
+#: anyway) while capping worst-case API usage.
+_deepl_rate_limiter = _SlidingWindowRateLimiter(max_calls=10, period_seconds=60.0)
+
+
 @lru_cache(maxsize=1)
 def _get_client() -> deepl.Translator:
     """Return a cached :class:`deepl.Translator` built from ``DEEPL_API_KEY``.
@@ -120,8 +180,17 @@ def _translate(text: str, *, formality: str = "default") -> str:
 
     Returns:
         The Japanese translation.
+
+    Raises:
+        TranslatorNotConfiguredError: If ``DEEPL_API_KEY`` is unset/empty.
+        TranslatorRateLimitedError: If the shared DeepL call budget (10/min) is
+            already spent — no fallback exists for this direction, so the
+            caller should skip the translation for this hover.
     """
     client = _get_client()
+    if not _deepl_rate_limiter.try_acquire():
+        _logger.warning("DeepL rate limit hit (10/min) — skipping EN->JA translation")
+        raise TranslatorRateLimitedError("DeepL call budget (10/min) exhausted")
     result = client.translate_text(
         text, source_lang="EN", target_lang="JA", formality=formality
     )
@@ -145,6 +214,13 @@ _CLAUDE_TRANSLATION_SYSTEM = (
 #: or a transient network error, should not stick.
 _JA_EN_CACHE: dict[str, str] = {}
 _JA_EN_CACHE_MAX = 256
+
+#: Full :func:`english_to_japanese` results keyed by source text — same
+#: rationale as :data:`_JA_EN_CACHE`, but for the EN->JA direction, where an
+#: uncached hover would otherwise cost up to 4 DeepL calls (one translation +
+#: three formality alternatives) instead of 1.
+_EN_JA_CACHE: dict[str, dict] = {}
+_EN_JA_CACHE_MAX = 256
 
 
 def _anthropic_configured() -> bool:
@@ -222,13 +298,18 @@ def japanese_to_english(text: str) -> str | None:
     except Exception:
         client = None
     if client is not None:
-        try:
-            # DeepL rejects a bare "EN" target — it wants a regional variant.
-            result = client.translate_text(
-                text, source_lang="JA", target_lang="EN-US"
-            ).text
-        except Exception:
-            result = None
+        if not _deepl_rate_limiter.try_acquire():
+            _logger.warning(
+                "DeepL rate limit hit (10/min) — falling back to Claude for JA->EN"
+            )
+        else:
+            try:
+                # DeepL rejects a bare "EN" target — it wants a regional variant.
+                result = client.translate_text(
+                    text, source_lang="JA", target_lang="EN-US"
+                ).text
+            except Exception:
+                result = None
 
     if not result and _anthropic_configured():
         try:
@@ -267,7 +348,14 @@ def english_to_japanese(text: str) -> dict:
 
     Raises:
         TranslatorNotConfiguredError: If ``DEEPL_API_KEY`` is unset/empty.
+        TranslatorRateLimitedError: If the DeepL call budget (10/min) is
+            already spent and this text hasn't been translated before.
     """
+    cache_key = text.strip()
+    cached = _EN_JA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     translation = _translate(text)
     tokens = tokenise(translation)
     classified = classify_tokens(tokens)
@@ -278,12 +366,20 @@ def english_to_japanese(text: str) -> dict:
     # as its hardest word.
     hardest_level = min(content_levels) if content_levels else None
 
-    alternatives = [_translate(text, formality=f) for f in _ALTERNATIVE_FORMALITY]
+    # The main translation above already spent one call; if the budget runs
+    # out partway through these three, keep whichever alternatives were
+    # already fetched rather than failing the whole lookup.
+    alternatives: list[str] = []
+    for formality in _ALTERNATIVE_FORMALITY:
+        try:
+            alternatives.append(_translate(text, formality=formality))
+        except TranslatorRateLimitedError:
+            break
     # Deduplicate while preserving order — DeepL sometimes returns identical
     # text for "less"/"default"/"more" when a sentence has no formality axis.
     alternatives = list(dict.fromkeys(alternatives))
 
-    return {
+    result = {
         "translation": translation,
         "reading": reading,
         "jlpt_level": _jlpt_name(hardest_level),
@@ -291,6 +387,11 @@ def english_to_japanese(text: str) -> dict:
         "grammar_patterns": find_grammar_patterns(translation),
         "alternatives": alternatives,
     }
+
+    if len(_EN_JA_CACHE) >= _EN_JA_CACHE_MAX:
+        _EN_JA_CACHE.pop(next(iter(_EN_JA_CACHE)))
+    _EN_JA_CACHE[cache_key] = result
+    return result
 
 
 if __name__ == "__main__":

@@ -507,15 +507,33 @@ function FlashcardsTab() {
 function StatsTab() {
   const [review, setReview] = useState<ReviewWordsResponse | null>(null);
   const [stats, setStats] = useState<StatsResponse | null>(null);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [cleared, setCleared] = useState(false);
 
-  useEffect(() => {
+  const load = () => {
     void fetch(`${API}/review/words`)
       .then((r) => r.json())
       .then(setReview);
     void fetch(`${API}/stats`)
       .then((r) => r.json())
       .then(setStats);
-  }, []);
+  };
+
+  useEffect(load, []);
+
+  const clearAllData = () => {
+    setClearing(true);
+    void fetch(`${API}/data/all`, { method: "DELETE" })
+      .then((r) => r.json())
+      .then(() => {
+        setConfirmingClear(false);
+        setClearing(false);
+        setCleared(true);
+        load();
+      })
+      .catch(() => setClearing(false));
+  };
 
   if (!review || !stats) {
     return <div style={{ opacity: 0.6 }}>Loading…</div>;
@@ -608,6 +626,81 @@ function StatsTab() {
             <span style={{ color: "#94a3b8", marginLeft: "auto" }}>{w.times_seen}x</span>
           </div>
         ))}
+      </div>
+
+      <div
+        style={{
+          marginTop: 24,
+          padding: 20,
+          borderRadius: 12,
+          border: "1px solid rgba(239,68,68,0.25)",
+          background: "rgba(239,68,68,0.04)",
+        }}
+      >
+        <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 4, color: "#f87171" }}>
+          Danger zone
+        </div>
+        <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 14 }}>
+          Permanently delete every saved word, sentence, and grammar pattern, and reset your
+          review progress. This cannot be undone.
+        </div>
+
+        {cleared ? (
+          <div style={{ fontSize: 13, color: "#4ade80" }}>All data cleared.</div>
+        ) : !confirmingClear ? (
+          <button
+            onClick={() => setConfirmingClear(true)}
+            style={{
+              padding: "8px 16px",
+              borderRadius: 8,
+              border: "1px solid rgba(239,68,68,0.4)",
+              background: "rgba(239,68,68,0.12)",
+              color: "#f87171",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            Clear all data
+          </button>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 13, color: "#e2e8f0" }}>Are you sure?</span>
+            <button
+              onClick={clearAllData}
+              disabled={clearing}
+              style={{
+                padding: "8px 16px",
+                borderRadius: 8,
+                border: "1px solid rgba(239,68,68,0.5)",
+                background: "#ef4444",
+                color: "#fff",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: clearing ? "default" : "pointer",
+                opacity: clearing ? 0.6 : 1,
+              }}
+            >
+              {clearing ? "Clearing…" : "Yes, delete everything"}
+            </button>
+            <button
+              onClick={() => setConfirmingClear(false)}
+              disabled={clearing}
+              style={{
+                padding: "8px 16px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.12)",
+                background: "transparent",
+                color: "#94a3b8",
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: clearing ? "default" : "pointer",
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

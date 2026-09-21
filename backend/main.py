@@ -34,6 +34,8 @@ died and the server must be stopped and restarted. Routes:
 * ``GET  /word/{word}/sentences`` – up to 3 Tatoeba example sentences for a
   word (:mod:`sentences`).
 * ``GET  /stats`` – aggregate progress statistics.
+* ``DELETE /data/all`` – wipe every saved word/sentence/grammar pattern and
+  all encounter/review history; the review window's "Clear all data" reset.
 
 Before first use:
 
@@ -48,17 +50,21 @@ Before first use:
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import AsyncIterator
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
+
+from logging_config import setup_logging
 
 from accessibility import (
     accessibility_permission_granted,
@@ -89,11 +95,19 @@ from spaced_rep import sm2
 from tokeniser import tokenise
 from translator import (
     TranslatorNotConfiguredError,
+    TranslatorRateLimitedError,
     english_to_japanese,
     japanese_to_english,
 )
 
 API_VERSION = "0.4.0"
+
+# Attach the rotating file handler + crash hooks as early as possible, so any
+# error further down (dictionary build, OCR warmup, a bad /hover request)
+# lands in ~/Library/Logs/Mirume/mirume.log instead of vanishing — the
+# packaged app has no visible terminal.
+setup_logging()
+logger = logging.getLogger("mirume.main")
 
 #: Placeholder Japanese sentence returned by the /hover stub — "Studying
 #: Japanese is hard, but it's fun." Chosen to span several JLPT levels so the
@@ -117,33 +131,39 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Control back to FastAPI for the lifetime of the application.
     """
     init_databases()
+    logger.info("Mirume backend starting (version %s)", API_VERSION)
     if not example_sentences_ready():
-        print(
-            "\n[mirume] Tatoeba example sentences are not built yet — "
-            "/word/{word}/sentences and the review window's flashcards will "
-            "return no example sentences.\n"
-            "[mirume] Run:  python sentences.py build\n"
+        msg = (
+            "Tatoeba example sentences are not built yet — /word/{word}/sentences "
+            "and the review window's flashcards will return no example sentences. "
+            "Run:  python sentences.py build"
         )
+        print(f"\n[mirume] {msg}\n")
+        logger.warning(msg)
     if not dictionary_ready():
-        print(
-            "\n[mirume] JMdict dictionary is not built yet — /hover will return "
-            "'unknown' for every word.\n"
-            "[mirume] Run:  python jlpt.py build\n"
+        msg = (
+            "JMdict dictionary is not built yet — /hover will return 'unknown' "
+            "for every word. Run:  python jlpt.py build"
         )
+        print(f"\n[mirume] {msg}\n")
+        logger.warning(msg)
     if not accessibility_permission_granted():
-        print(
-            "\n[mirume] macOS Accessibility permission not granted — /hover will "
-            "always fall back to the placeholder sentence.\n"
-            "[mirume] Grant it in System Settings > Privacy & Security > "
-            "Accessibility for your terminal (or Python), then restart.\n"
+        msg = (
+            "macOS Accessibility permission not granted — /hover will always "
+            "fall back to the placeholder sentence. Grant it in System Settings "
+            "> Privacy & Security > Accessibility for your terminal (or "
+            "Python), then restart."
         )
+        print(f"\n[mirume] {msg}\n")
+        logger.warning(msg)
     if not os.environ.get("DEEPL_API_KEY", "").strip():
-        print(
-            "\n[mirume] DEEPL_API_KEY is not set — /hover will detect English text "
-            "but skip translation.\n"
-            "[mirume] Add it to backend/.env (get a free-tier key at "
-            "https://www.deepl.com/pro-api).\n"
+        msg = (
+            "DEEPL_API_KEY is not set — /hover will detect English text but "
+            "skip translation. Add it to backend/.env (get a free-tier key at "
+            "https://www.deepl.com/pro-api)."
         )
+        print(f"\n[mirume] {msg}\n")
+        logger.warning(msg)
 
     # Start the persistent OCR worker thread. It issues one throwaway macOS
     # Vision recognition request to bring that stack up before the first real
@@ -157,8 +177,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
         start_ocr_worker()
     except Exception as exc:  # pragma: no cover - deps optional
-        print(f"[mirume] OCR warmup failed ({exc}); Chrome hover will be "
-              "slow on first use or unavailable.")
+        msg = f"OCR warmup failed ({exc}); Chrome hover will be slow on first use or unavailable."
+        print(f"[mirume] {msg}")
+        logger.exception(msg)
 
     yield
 
@@ -181,6 +202,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def log_unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """Log any exception a route handler doesn't catch, then return a 500.
+
+    FastAPI would otherwise turn this into a bare 500 with nothing recorded —
+    exactly the case a user-reported crash needs a trace for. Never raised
+    itself: a broken handler here must not replace the 500 with an even less
+    informative error.
+
+    Args:
+        request: The request that triggered the error.
+        exc: The unhandled exception.
+
+    Returns:
+        A generic 500 JSON response; details go to the log file, not the client.
+    """
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 # --------------------------------------------------------------------------- #
@@ -517,6 +558,16 @@ class DeleteWordResponse(BaseModel):
     deleted: bool
 
 
+class ClearAllDataResponse(BaseModel):
+    """Body returned by ``DELETE /data/all``."""
+
+    cleared: bool
+    words_deleted: int
+    sentences_deleted: int
+    grammar_deleted: int
+    encounters_deleted: int
+
+
 #: Hiragana, katakana and CJK ideograph ranges — used to split hover text into
 #: same-script runs so mixed Japanese/English text can be routed per-segment.
 _JAPANESE_SCRIPT_RE = re.compile(r"[぀-ヿ㐀-鿿ｦ-ﾟ]")
@@ -739,7 +790,7 @@ def _hover_sync(request: HoverRequest) -> HoverResponse:
         else:
             try:
                 result = english_to_japanese(segment)
-            except TranslatorNotConfiguredError:
+            except (TranslatorNotConfiguredError, TranslatorRateLimitedError):
                 continue
             translations.append(TranslationOut.from_result(segment, result))
 
@@ -1024,6 +1075,47 @@ def delete_review_word(word_id: int, db: Session = Depends(get_mirume_session)) 
     db.delete(word)
     db.commit()
     return DeleteWordResponse(deleted=True)
+
+
+@app.delete("/data/all", response_model=ClearAllDataResponse)
+def clear_all_data(db: Session = Depends(get_mirume_session)) -> ClearAllDataResponse:
+    """Delete every saved word, sentence, grammar pattern and encounter/review log.
+
+    The review window's "Clear all data" button — a full reset of the user's
+    local progress, with no way to undo it. Children are deleted before
+    :class:`SavedWord` even though their foreign keys are ``ON DELETE SET
+    NULL``, since SQLite only enforces that when ``PRAGMA foreign_keys`` is on.
+
+    Args:
+        db: ``mirume.db`` session (injected).
+
+    Returns:
+        A :class:`ClearAllDataResponse` with a per-table count of deleted rows.
+    """
+    words_deleted = db.execute(select(func.count()).select_from(SavedWord)).scalar_one()
+    sentences_deleted = db.execute(select(func.count()).select_from(SavedSentence)).scalar_one()
+    grammar_deleted = db.execute(select(func.count()).select_from(SavedGrammar)).scalar_one()
+    encounters_deleted = db.execute(select(func.count()).select_from(WordEncounter)).scalar_one()
+
+    db.execute(delete(ReviewLog))
+    db.execute(delete(WordEncounter))
+    db.execute(delete(SavedGrammar))
+    db.execute(delete(SavedSentence))
+    db.execute(delete(SavedWord))
+    db.commit()
+
+    logger.info(
+        "Cleared all user data: %d words, %d sentences, %d grammar, %d encounters",
+        words_deleted, sentences_deleted, grammar_deleted, encounters_deleted,
+    )
+
+    return ClearAllDataResponse(
+        cleared=True,
+        words_deleted=words_deleted,
+        sentences_deleted=sentences_deleted,
+        grammar_deleted=grammar_deleted,
+        encounters_deleted=encounters_deleted,
+    )
 
 
 @app.get("/stats", response_model=StatsResponse)

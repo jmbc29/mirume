@@ -17,13 +17,21 @@ a source checkout.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 
 import uvicorn
 
+from logging_config import setup_logging
 from paths import seed_from_bundle
+
+# Before anything else: a packaged app has no visible terminal, so a crash
+# during seeding or startup must land in ~/Library/Logs/Mirume/mirume.log or
+# it's unrecoverable — the user just sees the app quit.
+setup_logging()
+logger = logging.getLogger("mirume.server")
 
 #: Loopback address + port the Tauri frontend expects (see
 #: ``frontend/src/hooks/useMouseTracker.ts`` and ``ReviewApp.tsx``).
@@ -112,6 +120,7 @@ def main() -> None:
     from main import app
 
     log_level = os.environ.get("MIRUME_LOG_LEVEL", "info")
+    logger.info("Starting uvicorn on %s:%d", HOST, PORT)
     uvicorn.run(app, host=HOST, port=PORT, log_level=log_level, access_log=False)
 
 
